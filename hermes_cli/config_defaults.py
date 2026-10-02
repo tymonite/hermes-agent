@@ -1322,8 +1322,8 @@ DEFAULT_CONFIG = {
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
         # Periodic built-in memory review; 0 when an external provider auto-extracts.
         "nudge_interval": 10,
-        # External memory provider plugin (empty = built-in only); only ONE at a time: "openviking",
-        # "mem0", "holographic", "retaindb", "byterover", or a catalog-installed one ("hindsight").
+        # External memory provider plugin (empty = built-in only); only ONE at a time: "honcho",
+        # "mem0", "openviking", or a catalog-installed one ("hindsight", "holographic", ...).
         "provider": "",
     },
     # Subagent delegation — override the provider:model used by delegate_task so children run on a

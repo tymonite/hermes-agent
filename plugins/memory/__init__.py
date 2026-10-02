@@ -279,6 +279,25 @@ def import_provider_module(name: str, submodule: Optional[str] = None):
     return importlib.import_module(f"{package.__name__}.{submodule}") if submodule else package
 
 
+def release_store_handles_under(directory: "str | Path") -> int:
+    """Force-close the SQLite handles every LOADED provider copy holds under *directory*.
+
+    A profile delete/unserve must release them first: on Windows rmtree fails with WinError 32
+    while any is open (#88347). Store providers (holographic) are catalog plugins, loaded once
+    per home under ``_hermes_user_memory.<name>__source_<digest>``, so the copy holding the
+    doomed profile's handles is rarely the one ``import_provider_module`` resolves for the active
+    home. Scanning ``sys.modules`` reaches every copy and never imports one.
+    """
+    released = 0
+    for module_name, module in list(sys.modules.items()):
+        if not module_name.startswith(("plugins.memory.", f"{_USER_NAMESPACE}.")) or not module_name.endswith(".store"):
+            continue
+        release = getattr(getattr(module, "MemoryStore", None), "release_all_under", None)
+        if callable(release):
+            released += int(release(directory))
+    return released
+
+
 def _instantiate_subclass(namespace) -> Optional["MemoryProvider"]:
     """First instantiable ``MemoryProvider`` subclass found among *namespace*'s attributes."""
     from agent.memory_provider import MemoryProvider
