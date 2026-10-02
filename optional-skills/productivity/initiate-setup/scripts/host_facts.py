@@ -307,11 +307,9 @@ def _from_picks(cards: dict) -> list[dict]:
 
 
 def _from_machine(suggest: dict) -> list[dict]:
+    # No local-model row: the app's own offer sets that up on the managed runtime; a task chat would improvise one.
     kind = suggest.get("kind") or "computer"
-    if suggest.get("spark"):
-        return [{"id": "apps", "label": f"Install a few apps for this {kind}"},
-                {"id": "local_model", "label": "Set up a local model"}]
-    return [{"id": "apps", "label": f"Install a few apps for this {kind}"}] if suggest.get("fresh") else []
+    return [{"id": "apps", "label": f"Install a few apps for this {kind}"}] if suggest.get("spark") or suggest.get("fresh") else []
 
 
 def _from_nothing(suggest: dict) -> list[dict]:

@@ -81,7 +81,7 @@ Each step runs once. Never redo an earlier step. The connect card's answer is fi
 Options for a vague ask. Each one makes a thing in five minutes. Name only apps they picked or the scan saw. Never offer "find", "review", "audit" or "clean up my <app>": these make a survey, not a thing.
 
 - Work apps picked: "A daily brief from Linear and Slack", "A summary of my week".
-- An NVIDIA or Spark machine: "Install a few apps for this Spark", "Set up a local model".
+- An NVIDIA or Spark machine: "Install a few apps for this Spark".
 - A plugin picked: "A simple scene in Blender".
 - Otherwise: "A small HTML page about <something from the scan>", "A start page with links to my apps", "A quick script that tidies my Downloads".
 
@@ -102,7 +102,7 @@ Do not stop with nothing.
 3. Install only the picks the check did not find, one app per command: `brew install --cask <app>`. Say "already installed" for the others. Never reinstall.
 4. On Arm, after the installs, one `lipo -archs` command for the new apps. Say when an app is x64 only.
 5. List for them anything that needs a password, a licence or a payment. Never disable security settings.
-6. One line on what changed and the next slice (developer tools, drivers, a local model), then the close card.
+6. One line on what changed and the next slice (developer tools, drivers), then the close card.
 
 ### 5. Automations
 
@@ -116,6 +116,7 @@ Do not stop with nothing.
 
 - Real data only: from connected apps or tools signed in on this computer, such as a logged-in `gh` (say so). Never route around a connector: no IMAP, app password or scraping.
 - Ask before sending, deleting or scheduling anything.
+- A local model is set up by the app, not by you: point to Run locally in the model menu, or Settings, Providers, Local Models. Never install a model runtime or download a model yourself.
 - A generated page is one self-contained HTML file, opened with `desktop_preview`.
 - Save every new file in `~/hermes-first-task/`, never in the current folder. Do not copy files around. Say where each file is.
 - Find a plugin's tools with `tool_search` after the install. If its app is not running, say so.
