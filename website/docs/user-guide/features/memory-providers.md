@@ -6,7 +6,7 @@ description: "External memory provider plugins — Honcho, OpenViking, Mem0, Hin
 
 # Memory Providers
 
-Hermes Agent ships with 7 external memory provider plugins that give the agent persistent, cross-session knowledge beyond the built-in MEMORY.md and USER.md, and more (such as Hindsight) are available from the [plugin catalog](./plugins.md). Only **one** external provider can be active at a time — the built-in memory is always active alongside it.
+External memory provider plugins give the agent persistent, cross-session knowledge beyond the built-in MEMORY.md and USER.md. Honcho, OpenViking and Mem0 ship with Hermes; Hindsight, Holographic, RetainDB, ByteRover and Supermemory install from the [plugin catalog](./plugins.md) with `hermes plugins install <name>`. Only **one** external provider can be active at a time — the built-in memory is always active alongside it.
 
 ## Quick Start
 
@@ -22,8 +22,9 @@ Or set manually in `~/.hermes/config.yaml`:
 
 ```yaml
 memory:
-  provider: openviking   # or honcho, mem0, holographic, retaindb, byterover, supermemory,
-                         # or hindsight (plugin catalog — run `hermes plugins install hindsight` first)
+  provider: openviking   # or honcho, mem0, hindsight, holographic, retaindb, byterover, supermemory
+                         # (hindsight, holographic, retaindb, byterover and supermemory come from the
+                         # plugin catalog — run `hermes plugins install <name>` first)
 ```
 
 ## How It Works
@@ -503,12 +504,16 @@ What changes on disk: the plugin appears in `~/.hermes/plugins/hindsight/` and `
 
 ### Holographic
 
+:::info Plugin catalog
+Holographic is maintained by Nous Research and installed from the [plugin catalog](./plugins.md) rather than bundled with Hermes. Source and full configuration reference: [NousResearch/hermes-plugin-holographic](https://github.com/NousResearch/hermes-plugin-holographic). Existing setups are migrated automatically — see [Migrating from the bundled providers](#migrating-from-the-bundled-providers).
+:::
+
 Local SQLite fact store with FTS5 full-text search, trust scoring, and HRR (Holographic Reduced Representations) for compositional algebraic queries.
 
 | | |
 |---|---|
 | **Best for** | Local-only memory with advanced retrieval, no external dependencies |
-| **Requires** | Nothing (SQLite is always available). NumPy optional for HRR algebra. |
+| **Requires** | `hermes plugins install holographic`. Nothing else (SQLite is always available); NumPy optional for HRR algebra. |
 | **Data storage** | Local SQLite |
 | **Cost** | Free |
 
@@ -516,7 +521,8 @@ Local SQLite fact store with FTS5 full-text search, trust scoring, and HRR (Holo
 
 **Setup:**
 ```bash
-hermes memory setup    # select "holographic"
+hermes plugins install holographic   # from the plugin catalog
+hermes memory setup                  # select "holographic"
 # Or manually:
 hermes config set memory.provider holographic
 ```
@@ -539,12 +545,16 @@ hermes config set memory.provider holographic
 
 ### RetainDB
 
+:::info Plugin catalog
+RetainDB is maintained by Nous Research and installed from the [plugin catalog](./plugins.md) rather than bundled with Hermes. Source and full configuration reference: [NousResearch/hermes-plugin-retaindb](https://github.com/NousResearch/hermes-plugin-retaindb). Existing setups are migrated automatically — see [Migrating from the bundled providers](#migrating-from-the-bundled-providers).
+:::
+
 Cloud memory API with hybrid search (Vector + BM25 + Reranking), 7 memory types, and delta compression.
 
 | | |
 |---|---|
 | **Best for** | Teams already using RetainDB's infrastructure |
-| **Requires** | RetainDB account + API key |
+| **Requires** | `hermes plugins install retaindb`; RetainDB account + API key |
 | **Data storage** | RetainDB Cloud |
 | **Cost** | $20/month |
 
@@ -552,7 +562,8 @@ Cloud memory API with hybrid search (Vector + BM25 + Reranking), 7 memory types,
 
 **Setup:**
 ```bash
-hermes memory setup    # select "retaindb"
+hermes plugins install retaindb   # from the plugin catalog
+hermes memory setup               # select "retaindb"
 # Or manually:
 hermes config set memory.provider retaindb
 echo "RETAINDB_API_KEY=your-key" >> ~/.hermes/.env
@@ -562,12 +573,16 @@ echo "RETAINDB_API_KEY=your-key" >> ~/.hermes/.env
 
 ### ByteRover
 
+:::info Plugin catalog
+ByteRover is maintained by Nous Research and installed from the [plugin catalog](./plugins.md) rather than bundled with Hermes. Source and full configuration reference: [NousResearch/hermes-plugin-byterover](https://github.com/NousResearch/hermes-plugin-byterover). Existing setups are migrated automatically — see [Migrating from the bundled providers](#migrating-from-the-bundled-providers).
+:::
+
 Persistent memory via the `brv` CLI — hierarchical knowledge tree with tiered retrieval (fuzzy text → LLM-driven search). Local-first with optional cloud sync.
 
 | | |
 |---|---|
 | **Best for** | Developers who want portable, local-first memory with a CLI |
-| **Requires** | ByteRover CLI (`npm install -g byterover-cli` or [install script](https://byterover.dev)) |
+| **Requires** | `hermes plugins install byterover` plus the ByteRover CLI (`npm install -g byterover-cli` or [install script](https://byterover.dev)) |
 | **Data storage** | Local (default) or ByteRover Cloud (optional sync) |
 | **Cost** | Free (local) or ByteRover pricing (cloud) |
 
@@ -579,7 +594,8 @@ Persistent memory via the `brv` CLI — hierarchical knowledge tree with tiered 
 curl -fsSL https://byterover.dev/install.sh | sh
 
 # Then configure Hermes
-hermes memory setup    # select "byterover"
+hermes plugins install byterover   # from the plugin catalog
+hermes memory setup                # select "byterover"
 # Or manually:
 hermes config set memory.provider byterover
 ```
@@ -593,12 +609,16 @@ hermes config set memory.provider byterover
 
 ### Supermemory
 
+:::info Plugin catalog
+Supermemory is maintained by [Supermemory](https://github.com/supermemoryai/hermes-supermemory) and installed from the [plugin catalog](./plugins.md) rather than bundled with Hermes. Source and full configuration reference: [supermemoryai/hermes-supermemory](https://github.com/supermemoryai/hermes-supermemory). Existing setups are migrated automatically — see [Migrating from the bundled providers](#migrating-from-the-bundled-providers).
+:::
+
 Semantic long-term memory with profile recall, semantic search, explicit memory tools, and per-turn conversation capture (one document per session per 4-hour window).
 
 | | |
 |---|---|
 | **Best for** | Semantic recall with user profiling and session-level graph building |
-| **Requires** | `hermes memory setup` prepares the Supermemory SDK through PM; [cloud API key](http://app.supermemory.ai/integrations?connect=hermes), or a [self-hosted server](https://supermemory.ai/docs/self-hosting/overview) |
+| **Requires** | `hermes plugins install supermemory` (installs the Supermemory SDK with the plugin); [cloud API key](http://app.supermemory.ai/integrations?connect=hermes), or a [self-hosted server](https://supermemory.ai/docs/self-hosting/overview) |
 | **Data storage** | Supermemory Cloud or self-hosted |
 | **Cost** | Supermemory pricing (cloud) / free (self-hosted) |
 
@@ -606,7 +626,8 @@ Semantic long-term memory with profile recall, semantic search, explicit memory 
 
 **Setup:**
 ```bash
-hermes memory setup    # select "supermemory"
+hermes plugins install supermemory   # from the plugin catalog
+hermes memory setup                  # select "supermemory"
 # Or manually:
 hermes config set memory.provider supermemory
 echo 'SUPERMEMORY_API_KEY=***' >> ~/.hermes/.env
@@ -618,7 +639,7 @@ Self-hosted setup:
 npx supermemory local
 ```
 
-Before running `hermes memory setup`, set `base_url` in
+After `hermes plugins install supermemory` and before running `hermes memory setup`, set `base_url` in
 `$HERMES_HOME/supermemory.json`:
 
 ```json
@@ -718,10 +739,10 @@ package command. Restart Hermes after successful dependency preparation.
 | **OpenViking** | Self-hosted | Free | 6 | `openviking` + server | Filesystem hierarchy + tiered loading |
 | **Mem0** | Cloud/Self-hosted | Free/Paid | 4 | `mem0ai` | Server-side LLM extraction + self-hosted/OSS modes |
 | **Hindsight** (plugin catalog) | Cloud/Local | Free/Paid | 3 | `hermes plugins install hindsight` | Knowledge graph + reflect synthesis |
-| **Holographic** | Local | Free | 2 | None | HRR algebra + trust scoring |
-| **RetainDB** | Cloud | $20/mo | 10 | `requests` | Delta compression |
-| **ByteRover** | Local/Cloud | Free/Paid | 3 | `brv` CLI | Pre-compression extraction |
-| **Supermemory** | Cloud/Self-hosted | Free/Paid | 4 | `supermemory` | Context fencing + session graph ingest + multi-container |
+| **Holographic** (plugin catalog) | Local | Free | 2 | `hermes plugins install holographic` | HRR algebra + trust scoring |
+| **RetainDB** (plugin catalog) | Cloud | $20/mo | 10 | `hermes plugins install retaindb` | Delta compression |
+| **ByteRover** (plugin catalog) | Local/Cloud | Free/Paid | 3 | `hermes plugins install byterover` + `brv` CLI | Pre-compression extraction |
+| **Supermemory** (plugin catalog) | Cloud/Self-hosted | Free/Paid | 4 | `hermes plugins install supermemory` | Context fencing + session graph ingest + multi-container |
 | **Memori** | Cloud | Free/Paid | 5 | `hermes-memori` | Tool-aware memory + structured recall |
 
 ## Profile Isolation
@@ -736,13 +757,53 @@ Each provider's data is isolated per [profile](../profiles.md):
 ## Providers Moving to the Plugin Catalog
 
 Memory providers are moving out of the Hermes tree into their maintainers' own repositories,
-published through the [plugin catalog](./plugins.md) — Hindsight is the first (see
-[Migrating from bundled Hindsight](#migrating-from-bundled-hindsight)). Nothing changes for you: the
+published through the [plugin catalog](./plugins.md). Hindsight moved first (see
+[Migrating from bundled Hindsight](#migrating-from-bundled-hindsight)), followed by Holographic,
+RetainDB, ByteRover and Supermemory (see
+[Migrating from the bundled providers](#migrating-from-the-bundled-providers)); Honcho, OpenViking
+and Mem0 are still bundled. Nothing changes for you: the
 provider name, your `memory.<name>` settings, its data directory and its tools stay the same.
 When a provider you have configured stops shipping with Hermes, `hermes update` installs its
 catalog plugin for every profile that names it; if you update through the Desktop app, the
 agent does the same the first time it starts (unless `security.allow_lazy_installs` is
 `false`, in which case it logs the `hermes plugins install <name>` one-liner instead).
+
+### Migrating from the bundled providers
+
+Supermemory, RetainDB, ByteRover and Holographic used to ship inside the Hermes tree (Supermemory
+also as the `hermes-agent[supermemory]` pip extra). Each now installs from the plugin catalog under
+the same name you use in `memory.provider`:
+
+| Provider | Maintained by | Source |
+|----------|---------------|--------|
+| `supermemory` | Supermemory | [supermemoryai/hermes-supermemory](https://github.com/supermemoryai/hermes-supermemory) |
+| `retaindb` | Nous Research | [NousResearch/hermes-plugin-retaindb](https://github.com/NousResearch/hermes-plugin-retaindb) |
+| `byterover` | Nous Research | [NousResearch/hermes-plugin-byterover](https://github.com/NousResearch/hermes-plugin-byterover) |
+| `holographic` | Nous Research | [NousResearch/hermes-plugin-holographic](https://github.com/NousResearch/hermes-plugin-holographic) |
+
+If your `config.yaml` already has `memory.provider` set to one of them, there is nothing to do for
+most users:
+
+- `hermes update` installs the catalog plugin into every profile home whose `memory.provider` names
+  a provider that no longer ships with Hermes (this runs even when `security.allow_lazy_installs`
+  is `false`).
+- If the plugin is still missing on the first agent start (`hermes chat`, the gateway, …), Hermes
+  installs it and prints, for example,
+  `✓ Memory provider 'holographic' moved out of core — installed its plugin from the catalog (your memory.holographic settings and data are unchanged).`
+- With `security.allow_lazy_installs: false`, the agent-start path instead logs one line —
+  ``Memory provider '<name>' is not installed; security.allow_lazy_installs is off — run `hermes plugins install <name>`.``
+  — and you run `hermes plugins install <name>` yourself.
+
+What changes on disk: the plugin appears in `~/.hermes/plugins/<name>/` and `config.yaml` gains the
+name under `plugins.enabled`. Python dependencies (the Supermemory SDK, for example) are installed
+from the plugin's own package metadata when the plugin installs, so the
+`hermes-agent[supermemory]` extra is no longer needed. `memory.provider`, `memory.<name>.*`,
+provider config files (`$HERMES_HOME/supermemory.json`, `$HERMES_HOME/<name>/`), the
+`SUPERMEMORY_*` / `RETAINDB_*` / `BRV_API_KEY` keys in `.env`, and your data — including
+Holographic's `memory_store.db` and its `plugins.hermes-memory-store` settings, and ByteRover's
+knowledge tree under `$HERMES_HOME/byterover/` — are untouched. ByteRover still needs the external
+`brv` CLI on `PATH`. Verify with `hermes memory status` (provider active) and `hermes plugins list`
+(plugin installed and enabled).
 
 ## Building a Memory Provider
 
