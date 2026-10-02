@@ -357,22 +357,58 @@ class TestMemoryManager:
         assert external.name not in mgr._external_prefetch_threads
 
 
+_SYNTHETIC_PROVIDER_INIT = (
+    "from agent.memory_provider import MemoryProvider\n"
+    "class SyntheticProvider(MemoryProvider):\n"
+    "    @property\n"
+    "    def name(self): return {name!r}\n"
+    "    def is_available(self): return True\n"
+    "    def initialize(self, **kw): pass\n"
+    "    def sync_turn(self, *a, **kw): pass\n"
+    "    def get_tool_schemas(self): return []\n"
+    "    def handle_tool_call(self, *a, **kw): return '{{}}'\n"
+)
+
+
+@pytest.fixture
+def bundled_memory_dir(tmp_path, monkeypatch):
+    """A stand-in for the bundled ``plugins/memory/`` tree holding one dependency-free provider.
+
+    No dependency-free provider ships in-tree any more (holographic moved to the plugin catalog),
+    so the bundled discovery/precedence paths run against a synthetic ``bundprov``.
+    """
+    import sys
+
+    import plugins.memory as memory_plugins
+
+    root = tmp_path / "bundled-memory"
+    (root / "bundprov").mkdir(parents=True)
+    (root / "bundprov" / "__init__.py").write_text(
+        _SYNTHETIC_PROVIDER_INIT.format(name="bundprov"), encoding="utf-8")
+    monkeypatch.setattr(memory_plugins, "_MEMORY_PLUGINS_DIR", root)
+    monkeypatch.setattr(memory_plugins, "_get_user_plugins_dir", lambda: None)
+    yield root
+    sys.modules.pop("plugins.memory.bundprov", None)
+    if hasattr(memory_plugins, "bundprov"):
+        delattr(memory_plugins, "bundprov")
+
+
 class TestPluginMemoryDiscovery:
     """Memory providers are discovered from plugins/memory/ directory."""
 
-    def test_discover_finds_providers(self):
+    def test_discover_finds_providers(self, bundled_memory_dir):
         """discover_memory_providers returns available providers."""
         from plugins.memory import discover_memory_providers
         providers = discover_memory_providers()
         names = [name for name, _, _ in providers]
-        assert "holographic" in names  # always available (no external deps)
+        assert "bundprov" in names  # always available (no external deps)
 
-    def test_load_provider_by_name(self):
+    def test_load_provider_by_name(self, bundled_memory_dir):
         """load_memory_provider returns a working provider instance."""
         from plugins.memory import load_memory_provider
-        p = load_memory_provider("holographic")
+        p = load_memory_provider("bundprov")
         assert p is not None
-        assert p.name == "holographic"
+        assert p.name == "bundprov"
         assert p.is_available()
 
     def test_load_nonexistent_returns_none(self):
@@ -423,36 +459,27 @@ class TestUserInstalledProviderDiscovery:
         assert p.name == "myexternal"
         assert p.is_available()
 
-    def test_bundled_takes_precedence(self, tmp_path, monkeypatch):
+    def test_bundled_takes_precedence(self, tmp_path, monkeypatch, bundled_memory_dir):
         """Bundled provider wins when user plugin has the same name."""
         from plugins.memory import load_memory_provider, discover_memory_providers
-        # Create user plugin named "holographic" (same as bundled)
-        plugin_dir = tmp_path / "plugins" / "holographic"
+        # Create user plugin named "bundprov" (same as bundled)
+        plugin_dir = tmp_path / "plugins" / "bundprov"
         plugin_dir.mkdir(parents=True)
         (plugin_dir / "__init__.py").write_text(
-            "from agent.memory_provider import MemoryProvider\n"
-            "class Fake(MemoryProvider):\n"
-            "    @property\n"
-            "    def name(self): return 'holographic-FAKE'\n"
-            "    def is_available(self): return True\n"
-            "    def initialize(self, **kw): pass\n"
-            "    def sync_turn(self, *a, **kw): pass\n"
-            "    def get_tool_schemas(self): return []\n"
-            "    def handle_tool_call(self, *a, **kw): return '{}'\n"
-        , encoding="utf-8")
+            _SYNTHETIC_PROVIDER_INIT.format(name="bundprov-FAKE"), encoding="utf-8")
         monkeypatch.setattr(
             "plugins.memory._get_user_plugins_dir",
             lambda: tmp_path / "plugins",
         )
-        # Load should return bundled (name "holographic"), not user (name "holographic-FAKE")
-        p = load_memory_provider("holographic")
+        # Load should return bundled (name "bundprov"), not user (name "bundprov-FAKE")
+        p = load_memory_provider("bundprov")
         assert p is not None
-        assert p.name == "holographic"  # bundled wins
+        assert p.name == "bundprov"  # bundled wins
 
         # discover should not duplicate
         providers = discover_memory_providers()
-        holo_count = sum(1 for n, _, _ in providers if n == "holographic")
-        assert holo_count == 1
+        bundled_count = sum(1 for n, _, _ in providers if n == "bundprov")
+        assert bundled_count == 1
 
 
 class TestUserInstalledProviderCli:

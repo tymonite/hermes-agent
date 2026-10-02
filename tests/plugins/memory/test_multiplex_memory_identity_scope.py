@@ -1,8 +1,8 @@
 """Multiplex invariant: memory-provider identity/tenant/endpoint never comes from the default profile.
 
 Under ``gateway.multiplex_profiles`` ``os.environ`` is the DEFAULT profile's ``.env``. When a secondary
-profile's scope does not define MEM0_USER_ID / SUPERMEMORY_CONTAINER_TAG / RETAINDB_PROJECT /
-OPENVIKING_* / HERMES_HONCHO_HOST, the provider must fall back to its own default
+profile's scope does not define MEM0_USER_ID / OPENVIKING_* /
+HERMES_HONCHO_HOST, the provider must fall back to its own default
 (per-profile partition), NOT write the secondary's memories into the default profile's account.
 """
 from __future__ import annotations
@@ -14,8 +14,6 @@ from agent import secret_scope
 _DEFAULT_ENV = {
     "MEM0_USER_ID": "user-default", "MEM0_AGENT_ID": "agent-default", "MEM0_HOST": "http://mem0.default",
     "MEM0_MODE": "self_hosted",
-    "SUPERMEMORY_CONTAINER_TAG": "tag-default", "SUPERMEMORY_BASE_URL": "https://sm.default",
-    "RETAINDB_PROJECT": "proj-default", "RETAINDB_BASE_URL": "https://rdb.default",
     "OPENVIKING_API_KEY": "ov-default", "OPENVIKING_ACCOUNT": "acct-default", "OPENVIKING_USER": "user-default",
     "OPENVIKING_AGENT": "agent-default", "OPENVIKING_ENDPOINT": "http://ov.default",
     "HERMES_HONCHO_HOST": "host-default", "HONCHO_BASE_URL": "https://honcho.default",
@@ -35,8 +33,7 @@ def secondary_profile(monkeypatch, tmp_path):
     (prof_b / "config.yaml").write_text("{}\n")
     monkeypatch.setenv("HERMES_HOME", str(prof_b))
     secret_scope.set_multiplex_active(True)
-    token = secret_scope.set_secret_scope({"RETAINDB_API_KEY": "rdb-b", "SUPERMEMORY_API_KEY": "sm-b",
-                                           "HONCHO_API_KEY": "honcho-b", "MEM0_API_KEY": "mem0-b"})
+    token = secret_scope.set_secret_scope({"HONCHO_API_KEY": "honcho-b", "MEM0_API_KEY": "mem0-b"})
     try:
         yield prof_b
     finally:
@@ -47,21 +44,11 @@ def secondary_profile(monkeypatch, tmp_path):
 def test_secondary_profile_memory_identity_never_inherits_default_environ(secondary_profile):
     import plugins.memory.mem0 as mem0
     import plugins.memory.openviking as openviking
-    import plugins.memory.retaindb as retaindb
-    import plugins.memory.supermemory as supermemory
     from plugins.memory.honcho import client as honcho_client
 
     cfg = mem0._load_config()
     assert "user_id" not in cfg  # falls back to the gateway-native id, not the default's user
     assert (cfg["agent_id"], cfg["host"], cfg["mode"]) == ("hermes", "", "platform")
-
-    assert supermemory._resolve_container_tag("cfg_tag", "id") == "cfg_tag"
-    assert "default" not in supermemory._resolve_base_url("")
-
-    provider = retaindb.RetainDBMemoryProvider()
-    provider.initialize("s1", hermes_home=str(secondary_profile))
-    assert provider._client.project == "hermes-b"
-    assert "default" not in provider._client.base_url
 
     settings = openviking._resolve_connection_settings({})
     assert (settings["api_key"], settings["account"], settings["user"]) == ("", "", "")
