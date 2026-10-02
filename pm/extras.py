@@ -41,7 +41,6 @@ ANCHORS: dict[str, str | tuple[str, ...]] = {
     "wake-porcupine": "pvporcupine",
     "fal": "fal_client",
     "honcho": "honcho",
-    "supermemory": "supermemory",
     "mem0": "mem0",
     "messaging": "telegram",
     "telegram": "telegram",
