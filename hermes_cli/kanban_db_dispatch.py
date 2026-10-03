@@ -83,9 +83,91 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
-    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
+    r"https?://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/pull/\d+",
     re.IGNORECASE,
 )
+
+# ``git remote get-url origin`` / project ``primary_path`` lookups must never hang the
+# dispatch tick (held under the board's dispatch lock) — a wedged network mount or a
+# credential helper prompt caps out fast and falls back to "can't tell" rather than
+# stalling every other ready card behind this one.
+_REPO_LOOKUP_TIMEOUT_SECONDS = 3
+
+_GIT_REMOTE_GITHUB_RE = re.compile(
+    r"github\.com[:/](?P<owner>[^/\s]+)/(?P<repo>[^/\s]+?)(?:\.git)?/?$",
+    re.IGNORECASE,
+)
+
+_CONTRACT_OWNER_REPO_RE = re.compile(r"^(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)$")
+_CONTRACT_PR_URL_RE = re.compile(
+    r"^https://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/pull/\d+$"
+)
+
+
+def _git_origin_repo_slug(path: "str | Path") -> Optional[str]:
+    """``owner/repo`` (lowercased) for the ``origin`` remote of the git repo at
+    ``path``, or ``None`` when ``path`` isn't a git checkout, has no GitHub
+    ``origin``, or the lookup fails/times out."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(path), "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=_REPO_LOOKUP_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    m = _GIT_REMOTE_GITHUB_RE.search(proc.stdout.strip())
+    if not m:
+        return None
+    return f"{m.group('owner').lower()}/{m.group('repo').lower()}"
+
+
+def _task_own_repo_slug(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """``owner/repo`` this task's own work happens in, or ``None`` when it can't be
+    determined (e.g. a ``scratch`` workspace with no git checkout of its own and
+    no declared PR contract).
+
+    Checked in order: ``completion_contract`` (an explicit ``OWNER/REPO`` or exact
+    PR URL — set at task creation for cards that publish via a tracked PR, the
+    authoritative source when present); a ``worktree``-kind task's
+    ``workspace_path`` IS a git checkout of the target repo; otherwise the task's
+    linked Project's ``primary_path`` (projects live in a separate per-profile DB,
+    opened lazily). Only called once a candidate PR-URL comment is already found
+    (#117224 — a foreign-repo PR link, e.g. an upstream library fix pasted for
+    context, must not guard a card that has nothing to do with that repo), so
+    this never runs on the hot no-PR-mentioned path.
+    """
+    row = conn.execute(
+        "SELECT workspace_kind, workspace_path, project_id, completion_contract "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    contract = row["completion_contract"]
+    if contract and contract != "local-only":
+        m = _CONTRACT_PR_URL_RE.match(contract) or _CONTRACT_OWNER_REPO_RE.match(contract)
+        if m:
+            return f"{m.group('owner').lower()}/{m.group('repo').lower()}"
+    if row["workspace_kind"] == "worktree" and row["workspace_path"]:
+        slug = _git_origin_repo_slug(row["workspace_path"])
+        if slug:
+            return slug
+    project_id = row["project_id"]
+    if project_id:
+        try:
+            from hermes_cli import projects_db as _pdb
+            with _pdb.connect() as pconn:
+                proj = _pdb.get_project(pconn, project_id)
+            primary_path = getattr(proj, "primary_path", None) if proj is not None else None
+            if primary_path:
+                slug = _git_origin_repo_slug(primary_path)
+                if slug:
+                    return slug
+        except Exception:
+            pass
+    return None
 
 
 @dataclass
@@ -1620,32 +1702,103 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    #    Exception: a handoff AFTER the newest PR comment (operator reassign,
+    #    Exception 1: a handoff AFTER the newest PR comment (operator reassign,
     #    reviewer changes_requested, review reopen) names the profile that must
     #    now work on THAT PR — a closer or the implementer finishing it, not a
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
+    #    Exception 2: the comment must be the TASK'S OWN worker reporting their
+    #    OWN PR, not a passing reference to someone else's work — a reviewer
+    #    or a different card's assignee citing a foreign PR under review, or a
+    #    follow-up card's comment pointing at the PR it must build on, is input
+    #    the worker should read, not evidence that a duplicate PR already
+    #    exists for THIS task. Only guard when the comment's author matches
+    #    the assignee this task actually had at the moment the comment landed.
+    #    Exception 3: the PR must be in THIS task's own repo (#117224) — a PR
+    #    link to a different repo (e.g. the task's own assignee pasting an
+    #    upstream library's fix for context) is not this card's own work
+    #    either, even posted by the right author. When the task's own repo
+    #    can't be determined at all (no completion_contract, no git checkout)
+    #    any PR link from the right author still counts, as before — there's
+    #    no signal to tell own from foreign repo in that case.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    own_repo: Optional[str] = None
+    own_repo_checked = False
     for c in conn.execute(
-        "SELECT body, created_at FROM task_comments "
+        "SELECT author, body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
         (task_id, pr_cutoff),
     ).fetchall():
         body = _kb._lossy_text(c["body"])
-        if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
+        if not body:
+            continue
+        matches = list(_RESPAWN_GUARD_PR_URL_RE.finditer(body))
+        if not matches:
+            continue
+        comment_at = int(c["created_at"] or 0)
+        comment_author = _kb._lossy_text(c["author"])
+        if comment_author != _assignee_as_of(conn, task_id, comment_at):
+            # Foreign comment (a different profile's reference/review input) —
+            # not this task's own published work.
+            continue
+        if not own_repo_checked:
+            own_repo = _task_own_repo_slug(conn, task_id)
+            own_repo_checked = True
+        if own_repo is None:
+            # No reliable own-repo signal — fall back to the pre-existing
+            # (coarser) "any PR link from the right author counts" behaviour.
+            own_matches = matches
+        else:
+            own_matches = [
+                m for m in matches
+                if f"{m.group('owner').lower()}/{m.group('repo').lower()}" == own_repo
+            ]
+        if not own_matches:
             continue
         events = conn.execute(
             # Strictly after: a same-second tie stays guarded (fail closed).
             "SELECT kind, payload FROM task_events "
             "WHERE task_id = ? AND created_at > ? "
             "AND kind IN ('assigned', 'changes_requested', 'review_reopened')",
-            (task_id, int(c["created_at"] or 0)),
+            (task_id, comment_at),
         ).fetchall()
         if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
             return None
         return "active_pr"
 
     return None
+
+
+def _assignee_as_of(conn: sqlite3.Connection, task_id: str, as_of_ts: int) -> Optional[str]:
+    """The task's assignee at ``as_of_ts``, reconstructed from ``assigned``
+    events so a later reassign/unassign doesn't retroactively change who
+    authored an earlier PR comment as "self" or "foreign".
+
+    The most recent ``assigned`` event at-or-before ``as_of_ts`` names the
+    assignee already in effect then. Absent such an event, no reassignment
+    had happened yet by ``as_of_ts``, so the assignee is whichever profile
+    the task started with — read from the EARLIEST ``assigned`` event's
+    ``from`` (the value just before the first-ever reassign), or the task's
+    current ``assignee`` column when it was never reassigned at all.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'assigned' "
+        "AND created_at <= ? ORDER BY created_at DESC LIMIT 1",
+        (task_id, as_of_ts),
+    ).fetchone()
+    if row is not None:
+        data = _kb._json_or(row["payload"], {})
+        return data.get("assignee") if isinstance(data, dict) else None
+    first = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'assigned' "
+        "ORDER BY created_at ASC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if first is not None:
+        data = _kb._json_or(first["payload"], {})
+        return data.get("from") if isinstance(data, dict) else None
+    trow = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    return trow["assignee"] if trow is not None else None
 
 
 def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
