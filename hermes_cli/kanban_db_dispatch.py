@@ -83,9 +83,92 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
-    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
+    r"https?://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/pull/\d+",
     re.IGNORECASE,
 )
+
+# ``git remote get-url origin`` / project ``primary_path`` lookups must never hang the
+# dispatch tick (held under the board's dispatch lock) — a wedged network mount or a
+# credential helper prompt caps out fast and falls back to "can't tell" rather than
+# stalling every other ready card behind this one.
+_REPO_LOOKUP_TIMEOUT_SECONDS = 3
+
+_GIT_REMOTE_GITHUB_RE = re.compile(
+    r"github\.com[:/](?P<owner>[^/\s]+)/(?P<repo>[^/\s]+?)(?:\.git)?/?$",
+    re.IGNORECASE,
+)
+
+
+def _git_origin_repo_slug(path: "str | Path") -> Optional[str]:
+    """``owner/repo`` (lowercased) for the ``origin`` remote of the git repo at
+    ``path``, or ``None`` when ``path`` isn't a git checkout, has no GitHub
+    ``origin``, or the lookup fails/times out."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(path), "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=_REPO_LOOKUP_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    m = _GIT_REMOTE_GITHUB_RE.search(proc.stdout.strip())
+    if not m:
+        return None
+    return f"{m.group('owner').lower()}/{m.group('repo').lower()}"
+
+
+_CONTRACT_OWNER_REPO_RE = re.compile(r"^(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)$")
+_CONTRACT_PR_URL_RE = re.compile(
+    r"^https://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/pull/\d+$"
+)
+
+
+def _task_own_repo_slug(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """``owner/repo`` this task's own work happens in, or ``None`` when it can't be
+    determined (e.g. a ``scratch`` workspace with no git checkout of its own and
+    no declared PR contract).
+
+    Checked in order: ``completion_contract`` (an explicit ``OWNER/REPO`` or exact
+    PR URL — set at task creation for cards that publish via a tracked PR, the
+    authoritative source when present); a ``worktree``-kind task's
+    ``workspace_path`` IS a git checkout of the target repo; otherwise the task's
+    linked Project's ``primary_path`` (projects live in a separate per-profile DB,
+    opened lazily). Only called once a candidate PR-URL comment is already found
+    (#117224 — foreign-repo PR links, e.g. an upstream library fix, must not guard
+    a card that has nothing to do with that repo), so this never runs on the hot
+    no-PR-mentioned path.
+    """
+    row = conn.execute(
+        "SELECT workspace_kind, workspace_path, project_id, completion_contract "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    contract = row["completion_contract"]
+    if contract and contract != "local-only":
+        m = _CONTRACT_PR_URL_RE.match(contract) or _CONTRACT_OWNER_REPO_RE.match(contract)
+        if m:
+            return f"{m.group('owner').lower()}/{m.group('repo').lower()}"
+    if row["workspace_kind"] == "worktree" and row["workspace_path"]:
+        slug = _git_origin_repo_slug(row["workspace_path"])
+        if slug:
+            return slug
+    project_id = row["project_id"]
+    if project_id:
+        try:
+            from hermes_cli import projects_db as _pdb
+            with _pdb.connect() as pconn:
+                proj = _pdb.get_project(pconn, project_id)
+            primary_path = getattr(proj, "primary_path", None) if proj is not None else None
+            if primary_path:
+                slug = _git_origin_repo_slug(primary_path)
+                if slug:
+                    return slug
+        except Exception:
+            pass
+    return None
 
 
 @dataclass
@@ -1537,9 +1620,14 @@ def check_respawn_guard(
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
-    (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
-    handoff event followed the comment: the named profile must work on that
-    PR). The review lane skips the last two: they are the *inputs* to a review
+    (GitHub PR URL for THIS task's own repo in a recent comment; re-spawning
+    risks a duplicate PR — unless a handoff event followed the comment: the
+    named profile must work on that PR). A PR link to a REPO DIFFERENT from
+    the task's own (#117224 — e.g. an upstream library fix pasted for context)
+    never counts; when the task's own repo can't be determined at all (no
+    ``completion_contract``, no git checkout) any PR link still counts, as
+    before — there's no signal to tell own from foreign in that case. The
+    review lane skips the last two: they are the *inputs* to a review
     handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
     passes own those.
     """
@@ -1625,14 +1713,43 @@ def check_respawn_guard(
     #    now work on THAT PR — a closer or the implementer finishing it, not a
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
+    #
+    #    A PR link only counts when it points at THIS task's own repo (#117224):
+    #    a foreign link — e.g. an upstream library's fix someone pasted for
+    #    context — is not this card's own work and must never guard it. When
+    #    the task's own repo can't be determined (e.g. a ``scratch`` workspace
+    #    with no git checkout of its own and no declared PR contract) the old,
+    #    conservative "any PR link counts" behaviour still applies — there's no
+    #    reliable signal to tell own from foreign, and the dominant real-world
+    #    case for THAT fallback is a worker's own ad-hoc PR link, not a foreign
+    #    one, so failing toward the existing guard is the safer default.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    own_repo: Optional[str] = None
+    own_repo_checked = False
     for c in conn.execute(
         "SELECT body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
         (task_id, pr_cutoff),
     ).fetchall():
         body = _kb._lossy_text(c["body"])
-        if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
+        if not body:
+            continue
+        matches = list(_RESPAWN_GUARD_PR_URL_RE.finditer(body))
+        if not matches:
+            continue
+        if not own_repo_checked:
+            own_repo = _task_own_repo_slug(conn, task_id)
+            own_repo_checked = True
+        if own_repo is None:
+            # No reliable own-repo signal — fall back to the pre-existing
+            # (coarser) "any PR link counts" behaviour.
+            own_matches = matches
+        else:
+            own_matches = [
+                m for m in matches
+                if f"{m.group('owner').lower()}/{m.group('repo').lower()}" == own_repo
+            ]
+        if not own_matches:
             continue
         events = conn.execute(
             # Strictly after: a same-second tie stays guarded (fail closed).

@@ -745,6 +745,78 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+def test_respawn_guard_ignores_pr_link_to_a_foreign_repo(kanban_home, tmp_path):
+    """A GitHub PR link in a comment that points at a DIFFERENT repo than the
+    task's own (e.g. an upstream library fix pasted for context) must never
+    guard the card against re-spawn (#117224) — only the task's own repo's PR
+    links are a duplicate-work signal."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", "https://github.com/acme/widgets.git"],
+        check=True, capture_output=True, text=True,
+    )
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="pr-guard-foreign", assignee="a",
+            workspace_kind="worktree", workspace_path=str(repo),
+        )
+        kb.add_comment(
+            conn, tid, "a",
+            "FYI the root cause is fixed upstream: "
+            "https://github.com/kornelski/http-cache-semantics/pull/58",
+        )
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+
+def test_respawn_guard_still_blocks_on_own_repo_pr_link(kanban_home, tmp_path):
+    """A PR link to the task's OWN repo still guards against a duplicate PR —
+    the acceptance behaviour the foreign-link fix must not regress."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", "https://github.com/acme/widgets.git"],
+        check=True, capture_output=True, text=True,
+    )
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="pr-guard-own", assignee="a",
+            workspace_kind="worktree", workspace_path=str(repo),
+        )
+        kb.add_comment(conn, tid, "a", "Opened https://github.com/acme/widgets/pull/12")
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_respawn_guard_falls_back_to_any_pr_link_when_own_repo_is_unresolvable(kanban_home):
+    """A ``scratch`` task with no git checkout and no declared PR contract has
+    no signal to tell its own repo from a foreign one — the pre-existing
+    coarser "any PR link counts" behaviour still applies rather than silently
+    dropping real duplicate-work protection."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="pr-guard-scratch", assignee="a")
+        kb.add_comment(conn, tid, "a", "Opened https://github.com/acme/widgets/pull/12")
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_respawn_guard_uses_completion_contract_as_own_repo_signal(kanban_home):
+    """A task whose ``completion_contract`` declares ``OWNER/REPO`` (set at
+    creation for PR-publication-tracked cards) uses that as the authoritative
+    own-repo signal, even with a ``scratch`` workspace — no git checkout
+    needed. A foreign-repo PR link is still ignored."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="pr-guard-contract", assignee="a")
+        conn.execute(
+            "UPDATE tasks SET completion_contract = 'acme/widgets' WHERE id = ?", (tid,),
+        )
+        conn.commit()
+        kb.add_comment(
+            conn, tid, "a",
+            "Root cause fixed upstream: https://github.com/kornelski/http-cache-semantics/pull/58",
+        )
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+        kb.add_comment(conn, tid, "a", "Opened https://github.com/acme/widgets/pull/9")
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
 
 
 
