@@ -49,6 +49,26 @@ _MASS_CRASH_DEFER_SECONDS = 20
 # grace window, never a correctness issue.
 _mass_crash_first_seen: "dict[str, float]" = {}
 
+# (board_slug, task_id) -> time.time() of the tick this board last reported
+# that task as an unconfirmed "dead, no exit code" candidate. The embedded
+# gateway dispatcher runs ``dispatch_once`` once per board, sequentially,
+# inside the SAME tick (``KanbanDispatcher.tick_once``) — so a systemic
+# probe failure (host under memory/CPU pressure) tends to hit several
+# boards in that same tick, just 1-2 workers per board. Counting
+# ``_MASS_CRASH_MIN_COUNT`` per board alone (the original implementation)
+# missed that cross-board pattern entirely: two boards with 1-2 dead
+# workers each never individually reach the threshold, so both skip the
+# confirmation window and get reclaimed (and respawned) instantly, even
+# though combined they are exactly the kind of same-tick, zero-confirmed-
+# exit cohort the mass-crash defer exists to protect against. Entries
+# older than ``_GLOBAL_UNKNOWN_COHORT_WINDOW_SECONDS`` are pruned so a
+# board that stops reporting a task doesn't linger in the global count.
+_global_unknown_cohort: "dict[tuple[str, str], float]" = {}
+# Generous multiple of one dispatcher tick: every board's ``dispatch_once``
+# runs sequentially inside one tick (seconds, not minutes), so entries from
+# the same tick cohort across all boards are always within this window.
+_GLOBAL_UNKNOWN_COHORT_WINDOW_SECONDS = 30
+
 # Worker log files larger than this at spawn time are rotated.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
 DEFAULT_LOG_BACKUP_COUNT = 1
@@ -1229,14 +1249,35 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             row["id"] for row, _pid, dead in candidates
             if dead.kind == "unknown" and not dead.rate_limited
         }
-        mass_event = len(unknown_ids) >= _MASS_CRASH_MIN_COUNT
+        unknown_pids = {
+            row["id"]: pid for row, pid, dead in candidates
+            if dead.kind == "unknown" and not dead.rate_limited
+        }
+        board_key = board or _kb.get_current_board()
+        # Fold this board's current "unknown" candidates into the process-wide
+        # cohort, pruning anything stale first, so the threshold is judged
+        # across every board this process dispatches, not just this one.
+        stale_cutoff = now - _GLOBAL_UNKNOWN_COHORT_WINDOW_SECONDS
+        for key, seen_at in list(_global_unknown_cohort.items()):
+            if seen_at < stale_cutoff:
+                _global_unknown_cohort.pop(key, None)
+        for _bkey, _tid in list(_global_unknown_cohort):
+            if _bkey == board_key and _tid not in unknown_ids:
+                _global_unknown_cohort.pop((_bkey, _tid), None)
+        for tid in unknown_ids:
+            _global_unknown_cohort[(board_key, tid)] = now
+
+        mass_event = len(_global_unknown_cohort) >= _MASS_CRASH_MIN_COUNT
         if mass_event:
+            cross_board = sorted(_global_unknown_cohort)
             _kb._log.warning(
                 "kanban: %d workers reported dead in the same tick with no harvested "
-                "exit code (%s) — suspected systemic probe failure rather than a real "
-                "mass crash; deferring reclaim up to %ss per task for a second, "
-                "time-separated confirmation instead of respawning duplicates",
-                len(unknown_ids), sorted(unknown_ids), _MASS_CRASH_DEFER_SECONDS,
+                "exit code across %d board(s) (%s) — suspected systemic probe failure "
+                "rather than a real mass crash; deferring reclaim up to %ss per task "
+                "for a second, time-separated confirmation instead of respawning "
+                "duplicates. This board's pids: %s",
+                len(_global_unknown_cohort), len({b for b, _t in cross_board}), cross_board,
+                _MASS_CRASH_DEFER_SECONDS, {tid: unknown_pids[tid] for tid in unknown_ids},
             )
         # Drop stale per-task state for tasks no longer in an unconfirmed cohort
         # (worker came back alive, or already reclaimed) so the dict can't leak.
@@ -1246,11 +1287,13 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
 
         for row, pid, dead in candidates:
             tid = row["id"]
+            deferring = False
             if mass_event and tid in unknown_ids:
                 first_seen = _mass_crash_first_seen.setdefault(tid, now)
                 if now - first_seen < _MASS_CRASH_DEFER_SECONDS:
-                    continue  # inside the confirmation window — not reclaimed yet
-            _mass_crash_first_seen.pop(tid, None)
+                    deferring = True
+            if deferring:
+                continue  # inside the confirmation window — not reclaimed yet
 
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
@@ -1262,7 +1305,22 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 (retry_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount != 1:
+                # Row changed out from under us (already reclaimed via another
+                # path, or the worker legitimately completed between the SELECT
+                # and here) — NOT a reason to re-arm the confirmation window if
+                # it reappears next tick still "running" with the same dead pid;
+                # only drop the per-task clock once the reclaim actually lands.
                 continue
+            _mass_crash_first_seen.pop(tid, None)
+            # Deliberately NOT popped from ``_global_unknown_cohort`` here: a
+            # same-tick sibling board processed right after this one (the
+            # embedded dispatcher visits boards sequentially within one tick)
+            # must still see this task counted when it folds in ITS OWN
+            # candidates a few milliseconds later, so a 2-board / 1-board
+            # split reliably reaches the combined threshold. The entry is
+            # cleaned up on this board's own NEXT visit (top-of-function
+            # cleanup, once the task is no longer in its ``unknown_ids``) or
+            # by the TTL prune, whichever comes first.
             run_id = _kb._end_run(
                 conn, row["id"],
                 outcome=dead.run_outcome, status=dead.run_outcome,
