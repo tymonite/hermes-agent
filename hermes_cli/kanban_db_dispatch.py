@@ -261,9 +261,37 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     """``(kind, code)`` for a reaped worker PID: ``clean_exit`` (rc 0 while
     still ``running`` = protocol violation), ``rate_limited``
     (``KANBAN_RATE_LIMIT_EXIT_CODE``, never counts as a failure),
-    ``nonzero_exit``, ``signaled`` (``code`` is the signal), ``unknown`` (pid
-    not in the reap registry; ``code`` None)."""
+    ``nonzero_exit``, ``signaled`` (``code`` is the signal), ``orphaned``
+    (pid is confirmed NOT our child — it outlived a gateway restart and was
+    reparented away, so this process can never waitpid() it; ``code`` None),
+    ``unknown`` (pid not in the reap registry and a direct, targeted
+    ``waitpid`` found nothing either; ``code`` None).
+
+    The bulk ``waitpid(-1)`` sweep in :func:`reap_worker_zombies` runs once
+    per dispatcher tick, BEFORE the per-board liveness probes that declare a
+    task's worker dead. Under a loaded host the probes can observe a pid in
+    zombie state a few hundred ms to several ticks AFTER that sweep already
+    ran and found nothing (#131204 — observed as a multi-minute gap between
+    zombie-reap log lines while tasks kept being declared dead with no exit
+    code, loadavg ~30 at the time). A targeted ``waitpid(pid, WNOHANG)``
+    right here, on the specific pid the caller already believes is dead,
+    closes that race: if it's still genuinely our child it reaps cleanly
+    even though the bulk sweep missed it this tick. ``ECHILD`` instead tells
+    us definitively this pid was never ours to reap from this process — the
+    worker outlived a gateway restart (dispatcher restart reparents every
+    still-running worker to launchd/init) and nothing running now can ever
+    recover its exit status via waitpid; that gets its own ``orphaned`` kind
+    so the event says WHY instead of silently losing the code."""
     entry = _recent_worker_exits.get(int(pid))
+    if entry is None and not _kb._IS_WINDOWS:
+        try:
+            reaped_pid, status = os.waitpid(int(pid), os.WNOHANG)
+        except ChildProcessError:
+            return ("orphaned", None)
+        else:
+            if reaped_pid == int(pid):
+                _record_worker_exit(reaped_pid, status)
+                entry = _recent_worker_exits.get(int(pid))
     if entry is None:
         return ("unknown", None)
     raw, _ = entry
@@ -1156,7 +1184,7 @@ def _classify_dead_worker_exit(
     epilogue (killed, OOM) leaves no trailer and stays a plain crash.
     """
     kind, code = _classify_worker_exit(pid)
-    if kind == "unknown" and task_id:
+    if kind in ("unknown", "orphaned") and task_id:
         logged = _worker_log_exit_code(task_id, board=board)
         if logged is not None:
             kind, code = _exit_code_kind(logged)
@@ -1198,11 +1226,19 @@ def _classify_dead_worker_exit(
         error_text = f"pid {pid} exited with code {code}"
     elif kind == "signaled":
         error_text = f"pid {pid} killed by signal {code}"
+    elif kind == "orphaned":
+        error_text = (
+            f"pid {pid} not alive — confirmed not a child of this dispatcher process "
+            "(waitpid raised ECHILD), so its exit status was never observable here; "
+            "it most likely outlived a gateway restart and was reparented away before it exited"
+        )
     else:
-        error_text = f"pid {pid} not alive"
-    event_payload = {"pid": pid, "claimer": claimer}
-    if code is not None and kind != "unknown":
-        event_payload["exit_kind"] = kind
+        error_text = f"pid {pid} not alive (no exit status could be harvested)"
+    # ``exit_kind`` is ALWAYS recorded now, even when no exit code could be
+    # harvested (``unknown``/``orphaned``): the done-criterion for #131204 is
+    # that every crash event says WHY, not just the ones where a code landed.
+    event_payload = {"pid": pid, "claimer": claimer, "exit_kind": kind}
+    if code is not None:
         event_payload["exit_code"] = code
     return _DeadWorker(kind, code, error_text, "crashed", event_payload)
 
@@ -1264,13 +1300,20 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             candidates.append((row, pid, dead))
 
         now = time.time()
+        # The mass-crash breaker groups BOTH ambiguous races ("unknown": the
+        # bulk sweep and the targeted retry both missed it) and definitively
+        # unreapable pids ("orphaned": confirmed ECHILD, not our child) —
+        # from the operator's seat both look identical ("N workers dead, 0
+        # exit codes harvested in this tick") and both deserve the same
+        # systemic-probe-failure suspicion before duplicates get spawned.
+        _NO_CODE_HARVESTED = ("unknown", "orphaned")
         unknown_ids = {
             row["id"] for row, _pid, dead in candidates
-            if dead.kind == "unknown" and not dead.rate_limited
+            if dead.kind in _NO_CODE_HARVESTED and not dead.rate_limited
         }
         unknown_pids = {
             row["id"]: pid for row, pid, dead in candidates
-            if dead.kind == "unknown" and not dead.rate_limited
+            if dead.kind in _NO_CODE_HARVESTED and not dead.rate_limited
         }
         board_key = board or _kb.get_current_board()
         # Fold this board's current "unknown" candidates into the process-wide

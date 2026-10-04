@@ -114,7 +114,11 @@ def test_crash_reclaim_fires_worker_exited(kanban_home, captured_hooks, monkeypa
     assert kw["task_id"] == tid
     assert kw["assignee"] == "worker"
     assert kw["worker_pid"] == 98765
-    assert kw["exit_kind"] == "unknown"
+    # 98765 was never actually spawned as our child, so the targeted
+    # waitpid() retry added for #131204 confirms ECHILD and classifies this
+    # as a definitively unreapable ("orphaned") pid rather than the merely
+    # ambiguous "unknown" — the event must say WHY no exit code landed.
+    assert kw["exit_kind"] == "orphaned"
     assert kw["exit_code"] is None
     assert kw["outcome"] == "crashed"
     assert kw["retry_status"] == "ready"
