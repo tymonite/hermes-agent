@@ -453,6 +453,15 @@ def _pid_recycled(pid: Optional[int], started_at) -> bool:
     "unknown", and unknown must NOT be treated as "recycled" (fail-dead): it falls back to "still ours"
     so a momentary read glitch never masquerades as a confirmed PID recycle. A genuinely recycled PID
     is caught on the next successful read instead.
+
+    The numeric start-time component is compared with ``START_TIME_DRIFT_TOLERANCE`` slack via
+    ``start_time_fingerprints_match``, not exact equality: on macOS ``current_instantiation_epoch()``
+    always reads ``""`` (it is Linux-only, see its docstring), so the "epoch|start" fingerprint
+    degrades to just the psutil-derived start time there, and repeated readings of the SAME
+    still-running process can disagree by up to ~1s across a ``kern.boottime`` adjustment (sleep/wake,
+    NTP correction — #117505). An exact-string-equality compare treated that drift as a confirmed
+    recycle: a genuinely alive, unchanged worker got mass-declared dead under load for no reason
+    other than the host having slept in between two liveness checks.
     """
     if started_at is None or not pid:
         return False
@@ -462,7 +471,17 @@ def _pid_recycled(pid: Optional[int], started_at) -> bool:
         current_fp = _process_fingerprint(int(pid))
         if current_fp is None:
             return False
-        return current_fp != started_at
+        cur_epoch, _, cur_start = current_fp.partition("|")
+        rec_epoch, _, rec_start = started_at.partition("|")
+        if cur_epoch != rec_epoch:
+            return True  # different boot/container instantiation — a genuine recycle
+        from gateway.status import start_time_fingerprints_match
+        try:
+            return not start_time_fingerprints_match(int(rec_start), int(cur_start))
+        except (TypeError, ValueError):
+            # Unparsable start-time component: fall back to the original strict
+            # compare rather than guessing.
+            return current_fp != started_at
     from gateway.status import _start_times_agree, get_process_start_time
     current = get_process_start_time(int(pid))
     if current is None:

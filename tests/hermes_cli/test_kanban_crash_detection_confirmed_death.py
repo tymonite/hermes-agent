@@ -151,6 +151,27 @@ def test_pid_recycled_still_true_for_a_genuinely_different_process(monkeypatch):
     assert kbd._pid_recycled(os.getpid(), "deadbeef-boot:1|12345") is True
 
 
+def test_pid_recycled_false_for_macos_boottime_drift_same_process(monkeypatch):
+    """A ~1s start-time drift on the SAME process (macOS kern.boottime shift
+    across a sleep/wake or NTP correction, #117505) must NOT read as a
+    recycle: the numeric start-time half of the fingerprint is compared with
+    ``START_TIME_DRIFT_TOLERANCE`` slack, not exact string equality. This is
+    the root cause behind workers being falsely declared dead: on macOS
+    ``current_instantiation_epoch()`` is always empty (Linux-only), so the
+    fingerprint reduces to just this drift-prone start-time reading."""
+    # Centisecond units (×100): 50 centiseconds = 0.5s drift, well inside the
+    # 200-centisecond (~2s) tolerance.
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda pid: "|500050")
+    assert kbd._pid_recycled(os.getpid(), "|500000") is False
+
+
+def test_pid_recycled_true_when_drift_exceeds_tolerance(monkeypatch):
+    """A start-time difference well beyond the drift tolerance is still a
+    genuine recycle, not swallowed by the new slack."""
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda pid: "|999999")
+    assert kbd._pid_recycled(os.getpid(), "|500000") is True
+
+
 # ---------------------------------------------------------------------------
 # Mass-crash circuit breaker on _reclaim_dead_workers / detect_crashed_workers.
 # ---------------------------------------------------------------------------
