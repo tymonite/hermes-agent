@@ -35,6 +35,20 @@ if TYPE_CHECKING:
 # dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
 DEFAULT_FAILURE_LIMIT = 2
 
+# ``_reclaim_dead_workers`` mass-crash circuit breaker: a same-tick cohort of
+# this many or more "dead, no exit code harvested" tasks is treated as a
+# suspected systemic probe failure rather than a real simultaneous crash of
+# every running agent (see that function's docstring).
+_MASS_CRASH_MIN_COUNT = 3
+# How long such a cohort is held before being reclaimed anyway (a genuinely
+# dead worker is still dead after this; a probe glitch has long since cleared).
+_MASS_CRASH_DEFER_SECONDS = 20
+# task_id -> time.time() of the first tick this process saw it as part of an
+# unconfirmed mass-death cohort. Process-local by design (matches
+# ``_recent_worker_exits``): a dispatcher restart just restarts this one
+# grace window, never a correctness issue.
+_mass_crash_first_seen: "dict[str, float]" = {}
+
 # Worker log files larger than this at spawn time are rotated.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
 DEFAULT_LOG_BACKUP_COUNT = 1
@@ -320,6 +334,17 @@ def _pid_alive(pid: Optional[int]) -> bool:
     worker would look "alive" forever between exit and reap. Linux: peek at
     ``/proc/<pid>/status`` and treat ``State: Z`` as dead; macOS: ask ``ps``
     for the BSD ``stat`` field and treat ``Z`` as dead.
+
+    Fail-dead only on a CONFIRMED signal (``kill(0)`` raised ESRCH, inside
+    ``_pid_exists``, or the secondary zombie probe positively read a ``Z``
+    state). A secondary probe that cannot be read at all — ``ps`` exits
+    non-zero (sandboxed/throttled host, momentary resource exhaustion),
+    times out, or the ``/proc`` entry raises something other than
+    "already gone" — answers "unknown", and unknown is NOT dead: the
+    already-confirmed ``kill(0)`` liveness answer wins (every running
+    worker on a host was once declared dead in the same tick because this
+    downgraded a live PID to dead whenever the secondary probe merely
+    failed to answer).
     """
     if not pid or pid <= 0:
         return False
@@ -336,7 +361,8 @@ def _pid_alive(pid: Optional[int]) -> bool:
                             return False
                         break
         except (FileNotFoundError, PermissionError, OSError):
-            # proc entry gone → already reaped; treat as dead.
+            # proc entry gone / unreadable → can't confirm zombie state
+            # either way; keep the kill(0)-confirmed "alive" answer.
             pass
     elif sys.platform == "darwin":
         try:
@@ -348,12 +374,14 @@ def _pid_alive(pid: Optional[int]) -> bool:
                 timeout=1,
                 check=False,
             )
-            if proc.returncode != 0:
+            if proc.returncode == 0 and "Z" in (proc.stdout or "").strip():
                 return False
-            if "Z" in (proc.stdout or "").strip():
-                return False
+            # Non-zero returncode (incl. transient "no such pid" races under
+            # load, or a sandboxed exec denial) is NOT a confirmed kill —
+            # ``ps`` can fail for reasons unrelated to the target process.
+            # The kill(0)-confirmed "alive" answer stands.
         except (OSError, subprocess.SubprocessError, TimeoutError):
-            # If the secondary probe fails, keep the kill(0) answer.
+            # Secondary probe unreadable: keep the kill(0) answer.
             pass
     return True
 
@@ -394,24 +422,35 @@ def _worker_alive(pid: Optional[int], started_at) -> bool:
 
 
 def _pid_recycled(pid: Optional[int], started_at) -> bool:
-    """True when a live ``pid`` is NOT the process fingerprinted at spawn (or the fingerprint can no
-    longer be read). Signalling it would hit a stranger. ``None`` fingerprint = legacy row, never
-    recycled; the UNVERIFIED marker is always foreign. An integer fingerprint (rows written before the
-    boot witness was added) compares the start time only."""
+    """True when a live ``pid`` is CONFIRMED to be a different process than the one fingerprinted at
+    spawn. Signalling it would hit a stranger. ``None`` fingerprint = legacy row, never recycled; the
+    UNVERIFIED marker is always foreign. An integer fingerprint (rows written before the boot witness
+    was added) compares the start time only.
+
+    When the current fingerprint/start-time cannot be read at all (``_process_fingerprint`` /
+    ``get_process_start_time`` returns ``None`` — a transient ``/proc`` or ``ps`` read failure, not a
+    process exit, which ``_pid_alive`` already ruled out before this is ever called), the answer is
+    "unknown", and unknown must NOT be treated as "recycled" (fail-dead): it falls back to "still ours"
+    so a momentary read glitch never masquerades as a confirmed PID recycle. A genuinely recycled PID
+    is caught on the next successful read instead.
+    """
     if started_at is None or not pid:
         return False
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return True
     if isinstance(started_at, str) and "|" in started_at:
-        return _process_fingerprint(int(pid)) != started_at
+        current_fp = _process_fingerprint(int(pid))
+        if current_fp is None:
+            return False
+        return current_fp != started_at
     from gateway.status import _start_times_agree, get_process_start_time
     current = get_process_start_time(int(pid))
     if current is None:
-        return True
+        return False
     try:
         return not _start_times_agree(current, started_at)
     except (TypeError, ValueError):
-        return True
+        return False
 
 
 def _kill_fn(signal_fn) -> Optional[Callable[[int, int], None]]:
@@ -1144,7 +1183,22 @@ class _CrashSweep:
 
 
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
-    """Release every host-local ``running`` task whose worker PID is dead."""
+    """Release every host-local ``running`` task whose worker PID is dead.
+
+    One txn, two passes: first classify every candidate WITHOUT mutating
+    anything, so a same-tick cohort of >= ``_MASS_CRASH_MIN_COUNT`` workers
+    that all look dead with no harvested exit code (``_classify_dead_worker``
+    kind ``unknown`` — the dispatcher never actually witnessed any of them
+    exit, it only computed liveness from a probe) can be told apart from an
+    ordinary one-off dead worker BEFORE any claim is released. A mass
+    same-second "everyone's dead" verdict with zero confirmed exits is far
+    more likely a systemic probe glitch on this host than a real
+    simultaneous crash of every running agent; reclaiming instantly would
+    spawn a duplicate worker beside every one of them. Such a cohort is
+    deferred for ``_MASS_CRASH_DEFER_SECONDS`` (state kept per task in
+    ``_mass_crash_first_seen``) and reclaimed only once the SAME task still
+    looks dead after that window — a second, time-separated confirmation.
+    """
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
         rows = conn.execute(
@@ -1153,6 +1207,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = _kb._host_prefix()
+        candidates: "list[tuple[Any, int, _DeadWorker]]" = []
         for row in rows:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
@@ -1167,6 +1222,36 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
 
             pid = int(row["worker_pid"])
             dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
+            candidates.append((row, pid, dead))
+
+        now = time.time()
+        unknown_ids = {
+            row["id"] for row, _pid, dead in candidates
+            if dead.kind == "unknown" and not dead.rate_limited
+        }
+        mass_event = len(unknown_ids) >= _MASS_CRASH_MIN_COUNT
+        if mass_event:
+            _kb._log.warning(
+                "kanban: %d workers reported dead in the same tick with no harvested "
+                "exit code (%s) — suspected systemic probe failure rather than a real "
+                "mass crash; deferring reclaim up to %ss per task for a second, "
+                "time-separated confirmation instead of respawning duplicates",
+                len(unknown_ids), sorted(unknown_ids), _MASS_CRASH_DEFER_SECONDS,
+            )
+        # Drop stale per-task state for tasks no longer in an unconfirmed cohort
+        # (worker came back alive, or already reclaimed) so the dict can't leak.
+        for tid in list(_mass_crash_first_seen):
+            if tid not in unknown_ids:
+                _mass_crash_first_seen.pop(tid, None)
+
+        for row, pid, dead in candidates:
+            tid = row["id"]
+            if mass_event and tid in unknown_ids:
+                first_seen = _mass_crash_first_seen.setdefault(tid, now)
+                if now - first_seen < _MASS_CRASH_DEFER_SECONDS:
+                    continue  # inside the confirmation window — not reclaimed yet
+            _mass_crash_first_seen.pop(tid, None)
+
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
