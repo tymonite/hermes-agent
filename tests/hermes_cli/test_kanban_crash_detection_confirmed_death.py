@@ -34,12 +34,14 @@ def board(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
     kbd._mass_crash_first_seen.clear()
+    kbd._global_unknown_cohort.clear()
     conn = kbc.connect(tmp_path / "kanban.db")
     try:
         yield conn
     finally:
         conn.close()
         kbd._mass_crash_first_seen.clear()
+        kbd._global_unknown_cohort.clear()
 
 
 def _claimed_running(conn, *, pid: int, started_at=None) -> str:
@@ -222,3 +224,53 @@ def test_mass_cohort_member_coming_back_alive_is_not_reclaimed_later(board, monk
     for tid in tids:
         assert kb.get_task(conn, tid).status == "running"
     assert not kbd._mass_crash_first_seen
+
+
+def test_mass_crash_threshold_counts_across_boards(tmp_path, monkeypatch):
+    """Two boards with only 1-2 unconfirmed deaths each (below the per-board
+    threshold of 3) must still be recognised as ONE systemic probe-failure
+    cohort when the embedded gateway dispatches both in the same tick:
+    combined they cross ``_MASS_CRASH_MIN_COUNT``. The dispatcher visits
+    boards sequentially within one tick, so the board visited FIRST can't
+    see a sibling board's contribution yet (a one-tick lag is the accepted
+    trade-off, not a silent miss) — but the SAME-tick sibling visited right
+    after it does, and from the next tick onward (if the cohort is still
+    dead) every board in it defers."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    kbd._mass_crash_first_seen.clear()
+    kbd._global_unknown_cohort.clear()
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+
+    conn_a = kbc.connect(tmp_path / "board-a.db")
+    conn_b = kbc.connect(tmp_path / "board-b.db")
+    try:
+        tids_a = [_claimed_running(conn_a, pid=94000 + i) for i in range(2)]
+        tids_b = [_claimed_running(conn_b, pid=95000 + i) for i in range(1)]
+
+        # Tick 1: board A is visited first with only 2 dead of its own (below
+        # threshold) and reclaims immediately — exactly like the pre-existing
+        # single-board behaviour, since nothing cross-board is visible yet.
+        crashed_a = kbd.detect_crashed_workers(conn_a, board="board-a")
+        assert sorted(crashed_a) == sorted(tids_a)
+        for tid in tids_a:
+            assert kb.get_task(conn_a, tid).status == "ready"
+
+        # Board B, visited right after in the SAME tick, now folds in board
+        # A's just-reported cohort (still held, not yet pruned) and crosses
+        # the threshold (2 + 1 = 3): it defers instead of reclaiming.
+        crashed_b = kbd.detect_crashed_workers(conn_b, board="board-b")
+        assert crashed_b == []
+        for tid in tids_b:
+            assert kb.get_task(conn_b, tid).status == "running"
+
+        # After the confirmation window board B's worker is STILL dead -> reclaimed.
+        future = time.time() + kbd._MASS_CRASH_DEFER_SECONDS + 1
+        monkeypatch.setattr(kbd.time, "time", lambda: future)
+        crashed_b = kbd.detect_crashed_workers(conn_b, board="board-b")
+        assert sorted(crashed_b) == sorted(tids_b)
+    finally:
+        conn_a.close()
+        conn_b.close()
+        kbd._mass_crash_first_seen.clear()
+        kbd._global_unknown_cohort.clear()
