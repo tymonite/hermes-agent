@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -603,6 +604,143 @@ def test_active_pr_guard_lifts_for_implementer_after_changes_requested(
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (done_id,))
         assert kbd.check_respawn_guard(conn, done_id) == "recent_success"
+
+
+def test_active_pr_guard_ignores_foreign_authors_pr_reference(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PR URL mentioned by someone who is NOT this task's own worker must
+    not trip the duplicate-PR guard.
+
+    Covers two real shapes seen in production (DRE-230): a reviewer/other
+    worker commenting on an independent card about a PR from unrelated work
+    (``t_a379b83e``-style: default-profile card, comment names a dev's own
+    PR), and a follow-up/Nacharbeit card whose only comment references the
+    PR it must build on or review (``t_dd556b24``-style: never claimed,
+    comment from a different profile). Neither is the task's own published
+    duplicate work, so the guard must return ``None``.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+
+    with kbc.connect() as conn:
+        # Independent reader card: never implemented, a foreign reviewer's
+        # comment just references someone else's merged PRs.
+        reader_id = kb.create_task(conn, title="read-only review", assignee="reader")
+        kb.add_comment(
+            conn, reader_id, author="other-dev",
+            body="See https://github.com/example/repo/pull/250 and pull/251.",
+        )
+        assert kbd.check_respawn_guard(conn, reader_id) is None
+
+        # Follow-up/Nacharbeit card: never claimed by its own assignee, only
+        # a foreign reviewer's comment pointing at the PR under review.
+        followup_id = kb.create_task(conn, title="follow-up work", assignee="follower")
+        kb.add_comment(
+            conn, followup_id, author="some-reviewer",
+            body="Builds on https://github.com/example/repo/pull/198.",
+        )
+        assert kbd.check_respawn_guard(conn, followup_id) is None
+
+        res = kbd.dispatch_once(conn, dry_run=True)
+        guarded_ids = [t for t, _ in res.respawn_guarded]
+        assert reader_id not in guarded_ids
+        assert followup_id not in guarded_ids
+
+
+def test_active_pr_guard_still_blocks_same_author_genuine_duplicate(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression guard: the author-provenance check must not blanket-exempt
+    every PR mention — a comment from the task's OWN assignee at the time it
+    was posted still trips ``active_pr`` exactly as before (#111910)."""
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {})
+    pr_comment = "Opened https://github.com/example/repo/pull/77 for review."
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="own pr", assignee="dev")
+        kb.add_comment(conn, tid, author="dev", body=pr_comment)
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+        res = kbd.dispatch_once(conn, dry_run=True)
+        assert dict(res.respawn_guarded).get(tid) == "active_pr"
+
+
+def _init_git_repo_with_origin(repo: Path, origin_url: str) -> None:
+    repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "kanban@example.com"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Kanban Test"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", origin_url], check=True, capture_output=True, text=True)
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
+
+
+def test_active_pr_guard_ignores_own_author_foreign_repo_pr_link(
+    kanban_home: Path, tmp_path: Path,
+) -> None:
+    """The task's OWN assignee pasting a PR link to a DIFFERENT repo (e.g. an
+    upstream library's own fix, pasted for context) must not guard the card
+    either — #117224, the concrete 03.10.2026 incident (a link to
+    kornelski/http-cache-semantics parked an unrelated card for 24h)."""
+    repo = tmp_path / "repo"
+    _init_git_repo_with_origin(repo, "https://github.com/acme/widgets.git")
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="pr-guard-foreign-repo", assignee="dev",
+            workspace_kind="worktree", workspace_path=str(repo),
+        )
+        kb.add_comment(
+            conn, tid, author="dev",
+            body="FYI the root cause is fixed upstream: "
+                 "https://github.com/kornelski/http-cache-semantics/pull/58",
+        )
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+
+def test_active_pr_guard_still_blocks_own_author_own_repo_pr_link(
+    kanban_home: Path, tmp_path: Path,
+) -> None:
+    """A PR link to the task's OWN repo, from its own assignee, still guards —
+    the acceptance behaviour the foreign-repo fix must not regress."""
+    repo = tmp_path / "repo"
+    _init_git_repo_with_origin(repo, "https://github.com/acme/widgets.git")
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="pr-guard-own-repo", assignee="dev",
+            workspace_kind="worktree", workspace_path=str(repo),
+        )
+        kb.add_comment(conn, tid, author="dev", body="Opened https://github.com/acme/widgets/pull/12")
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
+
+
+def test_active_pr_guard_uses_completion_contract_as_own_repo_signal(
+    kanban_home: Path,
+) -> None:
+    """A ``completion_contract`` of ``OWNER/REPO`` is the authoritative own-repo
+    signal even on a ``scratch`` workspace with no git checkout — a foreign
+    link is ignored, the task's own repo still guards."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="pr-guard-contract", assignee="dev")
+        conn.execute("UPDATE tasks SET completion_contract = 'acme/widgets' WHERE id = ?", (tid,))
+        conn.commit()
+        kb.add_comment(
+            conn, tid, author="dev",
+            body="Root cause fixed upstream: "
+                 "https://github.com/kornelski/http-cache-semantics/pull/58",
+        )
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+        kb.add_comment(conn, tid, author="dev", body="Opened https://github.com/acme/widgets/pull/9")
+        assert kbd.check_respawn_guard(conn, tid) == "active_pr"
 
 
 def test_dispatch_json_exposes_suppression_reasons(
