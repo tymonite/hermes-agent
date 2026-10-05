@@ -3775,7 +3775,7 @@ def reopen_done_task_for_rework(
         return False, str(exc)
     with write_txn(conn):
         trow = conn.execute(
-            "SELECT status, completion_contract, current_run_id, claim_lock, worker_pid "
+            "SELECT status, completion_contract, assignee, current_run_id, claim_lock, worker_pid "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
@@ -3787,6 +3787,14 @@ def reopen_done_task_for_rework(
             return False, (
                 f"stale expectation: current completion_contract is {current_contract!r}, "
                 f"not the expected {expected_contract!r} — re-read the task before retrying"
+            )
+        if trow["assignee"] != assignee:
+            # The external gh pre-check verified the target PR against `assignee`'s
+            # login; if ownership changed underneath us while that network call ran,
+            # the verification is for the wrong identity and must not be trusted.
+            return False, (
+                f"stale expectation: current assignee is {trow['assignee']!r}, "
+                f"not the {assignee!r} the target PR was verified against — re-read the task before retrying"
             )
         if current_contract == new_contract:
             return False, "new_contract is identical to the current contract; nothing to recover"

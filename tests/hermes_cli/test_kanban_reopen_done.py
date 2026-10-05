@@ -241,6 +241,39 @@ def test_reopen_done_refuses_nonexistent_target_pr(conn):
     assert kb.get_task(conn, tid).status == "done"
 
 
+def test_reopen_done_refuses_stale_ownership_after_concurrent_reassignment(conn, monkeypatch):
+    """Reviewer's finding (round 2): the external `gh` pre-check verifies the
+    target PR against the assignee captured BEFORE that network call. If a
+    concurrent actor reassigns the task while the pre-check is in flight, the
+    verification was for the wrong identity and the atomic recheck under the
+    write transaction must refuse — not silently bind the PR to the new owner."""
+    tid = _done_with_contract(conn, assignee="claude-dev")
+
+    from hermes_cli import kanban_pr_acceptance as pra
+
+    def _race_then_verify(repo, number, *, assignee=None):
+        # Simulate a concurrent reassignment landing between the captured
+        # `assignee` read and the atomic recheck inside the write transaction.
+        conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", ("other-profile", tid))
+        _fake_verify_pr_target(repo, number, assignee=assignee)
+
+    monkeypatch.setattr(pra, "verify_pr_target", _race_then_verify)
+
+    before = _full_task_row(conn, tid)
+    ok, err = kb.reopen_done_task_for_rework(
+        conn, tid, expected_status="done", expected_contract=_PR39,
+        new_contract=_PR40, actor="cto",
+    )
+    assert not ok and "stale expectation" in err and "assignee" in err
+    after = _full_task_row(conn, tid)
+    assert after["assignee"] == "other-profile"  # the concurrent write itself is untouched
+    # Everything the recovery op itself would have changed stays exactly as before.
+    assert after["status"] == before["status"] == "done"
+    assert after["completion_contract"] == before["completion_contract"] == _PR39
+    assert after["completed_at"] == before["completed_at"]
+    assert after["result"] == before["result"]
+
+
 def test_reopen_done_lands_in_todo_when_a_parent_is_still_open(conn):
     parent = kb.create_task(conn, title="parent still running")
     tid = kb.create_task(conn, title="child rework", parents=[parent],

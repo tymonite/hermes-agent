@@ -63,9 +63,13 @@ def verify_pr_target(repo: str, number: int, *, assignee: str | None = None) -> 
         raise ValueError(f"target PR {repo}#{number} could not be verified ({exc})") from None
     except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError):
         raise ValueError(f"target PR {repo}#{number} could not be verified") from None
-    if not isinstance(pr, dict) or "state" not in pr:
+    state = pr.get("state") if isinstance(pr, dict) else None
+    if state not in ("open", "closed"):
+        # Anything but an explicit, recognized state (missing, None, or an
+        # unexpected value) is incomplete evidence, not a usable target —
+        # never fall through to "not closed therefore fine".
         raise ValueError(f"target PR {repo}#{number} could not be verified")
-    if pr["state"] == "closed" and not pr.get("merged"):
+    if state == "closed" and not pr.get("merged"):
         raise ValueError(f"target PR {repo}#{number} is closed and not merged; not a usable recovery target")
 
 
