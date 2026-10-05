@@ -1,0 +1,12 @@
+[
+  {
+    "note": "SYNTHETIC fixture. This is NOT a copy of any real user/model message. It only mirrors the field shape and the one structural property that mattered for the incident (ts 1790772886.423949, bot A0C55QD3DDM): a Slack message whose text is the gateway's reasoning-block template directly followed by the model's final response, with no per-platform opt-in set. Any resemblance in topic/wording to a real conversation is coincidental; it was written from scratch for this test.",
+    "user": "U0SYNTH0001",
+    "type": "message",
+    "ts": "1700000000.000001",
+    "bot_id": "B0SYNTH0001",
+    "app_id": "A0SYNTH0001",
+    "text": ":thought_balloon: *Reasoning:\u200b*\n```\n**Planning the requested task**\n\nI should check the current state before making any change, then apply the fix and verify it worked.\n```\n\n*Task completed successfully.\u200b*\n\n- Step one finished without errors.\n- Step two verified and confirmed healthy.",
+    "team": "T0SYNTH0001"
+  }
+]
