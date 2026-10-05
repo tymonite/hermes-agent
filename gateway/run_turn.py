@@ -1597,18 +1597,18 @@ class GatewayTurnMixin:
     }
 
     def _hmwa_prepend_reasoning(self, agent_result, response, source, _intentional_silence):
-        """Prepend the last reasoning block when show_reasoning is on for this platform. Mattermost
-        requires an explicit per-platform opt-in (scratch text, not final-answer content)."""
+        """Prepend the last reasoning block when enabled; Mattermost/Slack need explicit opt-in."""
         from gateway.run import _load_gateway_config, _platform_config_key, _resolve_gateway_display_bool
         try:
             _show_reasoning_effective = _resolve_gateway_display_bool(
                 _load_gateway_config(), _platform_config_key(source.platform), "show_reasoning",
                 default=bool(getattr(self, "_show_reasoning", False)), platform=source.platform,
-                require_platform_override_for={Platform.MATTERMOST},
+                require_platform_override_for={Platform.MATTERMOST, Platform.SLACK},
             )
         except Exception:
             _show_reasoning_effective = (
-                False if source.platform == Platform.MATTERMOST else getattr(self, "_show_reasoning", False)
+                False if source.platform in {Platform.MATTERMOST, Platform.SLACK}
+                else getattr(self, "_show_reasoning", False)
             )
         last_reasoning = agent_result.get("last_reasoning")
         if not (_show_reasoning_effective and response and not _intentional_silence and last_reasoning):
