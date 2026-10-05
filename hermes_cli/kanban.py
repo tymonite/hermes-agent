@@ -209,7 +209,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
-    "request-review", "request-changes", "reopen-review",
+    "request-review", "request-changes", "reopen-review", "reopen-done",
     "gc",
 })
 
@@ -1118,6 +1118,28 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_reopen_done(args: argparse.Namespace) -> int:
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err("kanban reopen-done is orchestrator-only; workers must hand off their assigned task")
+    tid = args.task_id
+    expected_contract = _stripped_or_none(getattr(args, "expected_contract", None))
+    new_contract = args.new_contract
+    reason = _stripped_or_none(getattr(args, "reason", None))
+    author = _profile_author()
+    with kbc.connect_closing() as conn:
+        ok, detail = kb.reopen_done_task_for_rework(
+            conn, tid, expected_status="done", expected_contract=expected_contract,
+            new_contract=new_contract, actor=author, reason=reason,
+        )
+        if not ok:
+            return _err(f"cannot reopen {tid} for rework: {detail}")
+        landed = kb.get_task(conn, tid)
+        where = landed.status if landed else "ready"
+    print(f"Reopened {tid} for rework -> {where} (contract: {new_contract})"
+          + (f": {reason}" if reason else ""))
+    return 0
+
+
 def _cmd_archive(args: argparse.Namespace) -> int:
     ids = list(args.task_ids or [])
     purge_ids = list(getattr(args, "purge_ids", None) or [])
@@ -1329,6 +1351,7 @@ _HANDLERS = {
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
+    "reopen-done": _cmd_reopen_done,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,

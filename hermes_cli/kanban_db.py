@@ -3691,6 +3691,95 @@ def promote_task(
     return True, None
 
 
+def reopen_done_task_for_rework(
+    conn: sqlite3.Connection, task_id: str, *, expected_status: str,
+    expected_contract: Optional[str], new_contract: str, actor: str,
+    reason: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """Explicit, audited recovery: a ``done`` task whose accepted contract has been
+    superseded by a NEW, still-open PR returns to rework bound to that PR — the one
+    gap ``promote_task``/``reopen_review_task``/``edit_task`` cannot reach (none of
+    them ever move a task out of ``done``, and ``edit_task`` never touches
+    status/completion_contract). Not a general reopen: a done task whose work truly
+    stands does not call this.
+
+    Refuses outright (no mutation) unless ALL hold, checked atomically under one
+    txn so a caller's stale read can never silently rebind the wrong task:
+      * ``expected_status`` is literally ``"done"`` (the caller must know what it
+        is recovering, not just retry until something sticks)
+      * the task's CURRENT status is ``done`` and its CURRENT completion_contract
+        equals ``expected_contract`` exactly — any drift (another actor already
+        touched it) is a stale expectation, refused rather than overwritten
+      * the task has no active claim/run (an active worker always wins; this is a
+        recovery path for an idle done task, not a way to interrupt one)
+      * ``new_contract`` validates as a real ``OWNER/REPO`` or exact GitHub PR URL
+        (:func:`validate_contract`) and is neither ``local-only`` (silent downgrade
+        refused) nor identical to ``expected_contract`` (a no-op rebind is refused —
+        there is nothing to recover)
+
+    On success: ``done`` -> landing status (``ready`` when every parent is
+    terminal, else ``todo`` — the same rule :func:`unblock_task`/
+    :func:`reopen_review_task` use), ``completion_contract`` = ``new_contract``,
+    ``completed_at``/``result`` cleared so the task reads as genuinely open work,
+    and the failure-breaker counters reset (a deliberate operator recovery, not a
+    retry of the same failure). The prior acceptance/completion events, comments
+    and run history are never rewritten — only a new ``reopened_for_rework`` audit
+    event is appended with the before/after status and contract and ``reason``, so
+    the fact the OLD contract was once accepted stays on the record while the new
+    PR is the only one that can author a fresh acceptance.
+
+    Returns ``(ok, reason)``: ``reason`` is ``None`` on success, a human-readable
+    refusal otherwise.
+    """
+    if expected_status != "done":
+        return False, "expected_status must be 'done'; this operation only recovers a prematurely-closed task"
+    from hermes_cli.kanban_pr_acceptance import validate_contract
+    try:
+        new_contract = validate_contract(new_contract)
+    except ValueError as exc:
+        return False, str(exc)
+    if new_contract == "local-only":
+        return False, "new_contract must be a real OWNER/REPO or PR URL; silent downgrade to local-only is refused"
+    expected_contract = _nonblank_str(expected_contract)
+    with write_txn(conn):
+        trow = conn.execute(
+            "SELECT status, completion_contract, current_run_id, claim_lock, worker_pid "
+            "FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if trow is None:
+            return False, f"task {task_id} not found"
+        if trow["status"] != "done":
+            return False, f"task {task_id} is {trow['status']!r}, not 'done'"
+        current_contract = _nonblank_str(trow["completion_contract"])
+        if current_contract != expected_contract:
+            return False, (
+                f"stale expectation: current completion_contract is {current_contract!r}, "
+                f"not the expected {expected_contract!r} — re-read the task before retrying"
+            )
+        if current_contract == new_contract:
+            return False, "new_contract is identical to the current contract; nothing to recover"
+        if trow["current_run_id"] is not None or trow["claim_lock"] is not None or trow["worker_pid"]:
+            return False, f"task {task_id} has an active run/claim; it is not idle 'done'"
+        landing_status = _landing_status_after_parents(conn, task_id)
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, completion_contract = ?, completed_at = NULL, "
+            "result = NULL, current_run_id = NULL, consecutive_failures = 0, "
+            "last_failure_error = NULL WHERE id = ? AND status = 'done'",
+            (landing_status, new_contract, task_id),
+        )
+        if cur.rowcount != 1:
+            return False, f"task {task_id} status changed during recovery"
+        _append_event(
+            conn, task_id, "reopened_for_rework",
+            {
+                "actor": actor, "reason": reason,
+                "prior_status": "done", "new_status": landing_status,
+                "prior_contract": current_contract, "new_contract": new_contract,
+            },
+        )
+    return True, None
+
+
 def _reclaim_dangling_run(
     conn: sqlite3.Connection, task_id: str, *, statuses, now: int, note: str,
 ) -> None:
