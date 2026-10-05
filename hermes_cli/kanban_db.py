@@ -3716,6 +3716,15 @@ def reopen_done_task_for_rework(
         (:func:`validate_contract`) and is neither ``local-only`` (silent downgrade
         refused) nor identical to ``expected_contract`` (a no-op rebind is refused —
         there is nothing to recover)
+      * ``new_contract`` is an EXACT PR URL (never a bare ``OWNER/REPO`` — a
+        repository-wide contract would reopen the binding to any later publication,
+        so recovery only ever pins a specific existing PR), stays within the SAME
+        repository ``expected_contract`` was bound to (no cross-repository
+        rebind), and is independently confirmed by ``gh``, outside the write
+        transaction, to be a real PR the assignee's login can read and that is
+        open or merged (:func:`kanban_pr_acceptance.verify_pr_target`) — the
+        status/contract/ownership fields themselves are still re-compared
+        atomically under the write transaction below before anything is applied
 
     On success: ``done`` -> landing status (``ready`` when every parent is
     terminal, else ``todo`` — the same rule :func:`unblock_task`/
@@ -3733,14 +3742,37 @@ def reopen_done_task_for_rework(
     """
     if expected_status != "done":
         return False, "expected_status must be 'done'; this operation only recovers a prematurely-closed task"
-    from hermes_cli.kanban_pr_acceptance import validate_contract
+    from hermes_cli import kanban_pr_acceptance as _pra
     try:
-        new_contract = validate_contract(new_contract)
+        new_contract = _pra.validate_contract(new_contract)
     except ValueError as exc:
         return False, str(exc)
     if new_contract == "local-only":
         return False, "new_contract must be a real OWNER/REPO or PR URL; silent downgrade to local-only is refused"
+    new_target = _pra.pr_repo_and_number(new_contract)
+    if new_target is None:
+        return False, (
+            "new_contract must be the exact existing correction PR URL "
+            "(OWNER/REPO/pull/N); a repository-wide contract is not accepted for a recovery rebind"
+        )
     expected_contract = _nonblank_str(expected_contract)
+    if new_contract == expected_contract:
+        return False, "new_contract is identical to the current contract; nothing to recover"
+    expected_repo = _pra.contract_repo(expected_contract)
+    if expected_repo is not None and new_target[0] != expected_repo:
+        return False, (
+            f"new_contract must stay within repository {expected_repo!r}; "
+            f"rebinding to a different repository is refused"
+        )
+    # External pre-check, outside the write transaction (network work never runs
+    # under a SQLite lock); the atomic recheck below re-verifies status/contract
+    # under the lock before this result is ever applied.
+    assignee_row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    assignee = assignee_row["assignee"] if assignee_row else None
+    try:
+        _pra.verify_pr_target(new_target[0], new_target[1], assignee=assignee)
+    except ValueError as exc:
+        return False, str(exc)
     with write_txn(conn):
         trow = conn.execute(
             "SELECT status, completion_contract, current_run_id, claim_lock, worker_pid "

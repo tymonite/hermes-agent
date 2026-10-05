@@ -45,6 +45,24 @@ def conn(kanban_home):
 _PR39 = "https://github.com/dree-projects/agent-ops/pull/39"
 _PR40 = "https://github.com/dree-projects/agent-ops/pull/40"
 
+# The real recovery op confirms the target PR with `gh` outside the write
+# transaction (hermes_cli.kanban_pr_acceptance.verify_pr_target). Fixture
+# tests must never depend on network/gh, so every test in this module runs
+# against a deterministic fake of exactly that seam — the one real PR the
+# scenario recovers to (PR40) exists and is open; nothing else does.
+_REAL_OPEN_PRS = {("dree-projects/agent-ops", 40)}
+
+
+def _fake_verify_pr_target(repo, number, *, assignee=None):
+    if (repo, number) not in _REAL_OPEN_PRS:
+        raise ValueError(f"target PR {repo}#{number} could not be verified")
+
+
+@pytest.fixture(autouse=True)
+def fake_pr_existence_check(monkeypatch):
+    from hermes_cli import kanban_pr_acceptance as pra
+    monkeypatch.setattr(pra, "verify_pr_target", _fake_verify_pr_target)
+
 
 def _done_with_contract(conn, *, contract=_PR39, assignee="claude-dev"):
     """Build the #DRE-449 scenario: a task closed 'done' bound to one PR.
@@ -183,6 +201,46 @@ def test_reopen_done_refuses_unknown_task(conn):
     assert not ok and "not found" in err
 
 
+def test_reopen_done_refuses_cross_repository_rebind(conn):
+    """The reviewer's blocking finding: a syntactically valid PR URL in a
+    different repository must not be accepted — the old contract's repo wins."""
+    tid = _done_with_contract(conn)
+    ok, err = kb.reopen_done_task_for_rework(
+        conn, tid, expected_status="done", expected_contract=_PR39,
+        new_contract="https://github.com/unrelated/repo/pull/40", actor="cto",
+    )
+    assert not ok and "repository" in err and "unrelated/repo" not in err.split("repository")[0]
+    assert kb.get_task(conn, tid).completion_contract == _PR39  # no partial mutation
+    assert kb.get_task(conn, tid).status == "done"
+
+
+def test_reopen_done_refuses_bare_repo_rebind(conn):
+    """No falling back from an exact PR to an open repository-wide contract —
+    recovery only ever pins a specific existing correction PR."""
+    tid = _done_with_contract(conn)
+    ok, err = kb.reopen_done_task_for_rework(
+        conn, tid, expected_status="done", expected_contract=_PR39,
+        new_contract="dree-projects/agent-ops", actor="cto",
+    )
+    assert not ok and "exact existing correction PR" in err
+    assert kb.get_task(conn, tid).completion_contract == _PR39
+    assert kb.get_task(conn, tid).status == "done"
+
+
+def test_reopen_done_refuses_nonexistent_target_pr(conn):
+    """Syntactically valid, same-repo, but the PR itself does not exist/is
+    unreadable: the external pre-check must still refuse it."""
+    tid = _done_with_contract(conn)
+    ok, err = kb.reopen_done_task_for_rework(
+        conn, tid, expected_status="done", expected_contract=_PR39,
+        new_contract="https://github.com/dree-projects/agent-ops/pull/99999999999999999999999",
+        actor="cto",
+    )
+    assert not ok and "could not be verified" in err
+    assert kb.get_task(conn, tid).completion_contract == _PR39
+    assert kb.get_task(conn, tid).status == "done"
+
+
 def test_reopen_done_lands_in_todo_when_a_parent_is_still_open(conn):
     parent = kb.create_task(conn, title="parent still running")
     tid = kb.create_task(conn, title="child rework", parents=[parent],
@@ -266,3 +324,38 @@ def test_cli_reopen_done_denied_from_a_worker_task_context(kanban_home, monkeypa
 
     with kbc.connect() as conn:
         assert kb.get_task(conn, tid).status == "done"
+
+
+def _full_task_row(conn, tid):
+    """Complete snapshot of the task row — used to prove a rejected call left
+    not even an incidental column touched (not just status/contract)."""
+    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone()
+    return dict(row)
+
+
+def test_cli_reopen_done_refuses_invalid_targets_with_full_null_mutation(kanban_home, capsys):
+    """Real public CLI, each semantically-invalid target the independent review
+    flagged (cross-repo, nonexistent PR, repo-wide fallback): exit != 0 and the
+    complete row is byte-identical to before the call, not just status/contract."""
+    cases = [
+        ("https://github.com/unrelated/repo/pull/40", "repository"),
+        ("https://github.com/dree-projects/agent-ops/pull/99999999999999999999999", "could not be verified"),
+        ("unrelated/repo", "exact existing correction PR"),
+    ]
+    for new_contract, expected_message_fragment in cases:
+        with kbc.connect() as conn:
+            tid = _done_with_contract(conn)
+            before = _full_task_row(conn, tid)
+
+        args = _parse([
+            "kanban", "reopen-done", tid,
+            "--expected-contract", _PR39, "--new-contract", new_contract,
+        ])
+        rc = kc.kanban_command(args)
+        assert rc != 0, new_contract
+        err = capsys.readouterr().err
+        assert expected_message_fragment in err, (new_contract, err)
+
+        with kbc.connect() as conn:
+            after = _full_task_row(conn, tid)
+        assert after == before, new_contract  # zero partial mutation, every column

@@ -28,6 +28,47 @@ def validate_contract(value: str | None) -> str:
     return value
 
 
+def pr_repo_and_number(contract: str | None) -> tuple[str, int] | None:
+    """``(repo, number)`` for an exact PR URL contract, else ``None`` (a bare
+    ``OWNER/REPO``, ``local-only``, or anything that is not a specific PR —
+    nothing a recovery rebind can pin an existence/usability check to)."""
+    m = _PR.fullmatch(contract or "")
+    return (m[1], int(m[2])) if m else None
+
+
+def contract_repo(contract: str | None) -> str | None:
+    """``OWNER/REPO`` for any valid non-``local-only`` contract (PR URL or bare
+    repo), else ``None``. Used to pin a recovery rebind to the repository the
+    task was already bound to, regardless of which contract shape it used."""
+    if not contract or contract == "local-only":
+        return None
+    m = _PR.fullmatch(contract)
+    if m:
+        return m[1]
+    return contract if _REPO.fullmatch(contract) else None
+
+
+def verify_pr_target(repo: str, number: int, *, assignee: str | None = None) -> None:
+    """Confirm ``repo``/``number`` is a real PR this profile's ``gh`` login can
+    read, and is open or was merged. Raises :class:`ValueError` — never a bare
+    bool — on any failure (nonexistent PR, foreign/unreadable repo, unusable
+    closed-unmerged PR) so a caller doing contract-rebind recovery refuses a
+    dead or unreadable target rather than silently rebinding to it. The
+    message is safe to surface: classification only, never ``gh`` stderr.
+    """
+    try:
+        profile_home = _assignee_profile_home(assignee)
+        pr = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
+    except _GateAuthError as exc:
+        raise ValueError(f"target PR {repo}#{number} could not be verified ({exc})") from None
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError):
+        raise ValueError(f"target PR {repo}#{number} could not be verified") from None
+    if not isinstance(pr, dict) or "state" not in pr:
+        raise ValueError(f"target PR {repo}#{number} could not be verified")
+    if pr["state"] == "closed" and not pr.get("merged"):
+        raise ValueError(f"target PR {repo}#{number} is closed and not merged; not a usable recovery target")
+
+
 def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
          profile_home: str | None = None):
     command = ["gh", "api", endpoint, "--hostname", "github.com"]
