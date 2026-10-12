@@ -23,16 +23,17 @@ def github(tmp_path, monkeypatch):
                 value = {"data": {"repository": {"pullRequest": {
                     "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
                     "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
-                        {"context": "required", "app": {"databaseId": 1}}]}}}}}}
+                        {"context": "required", "app": {"databaseId": state.get("required_app_id", 1)}}]}}}}}}
             elif "/rules/branches/" in self.path:
                 value = [[]]
             elif "/check-runs" in self.path:
                 run = {"id": 42, "name": "required", "head_sha": sha,
-                       "app": {"id": 1}, "status": "in_progress" if state["conclusion"] == "pending" else "completed", "conclusion": state["conclusion"],
+                       "app": state.get("app", {"id": 1}), "status": "in_progress" if state["conclusion"] == "pending" else "completed", "conclusion": state["conclusion"],
                        "html_url": "https://github.com/acme/repo/actions/runs/42"}
                 if state.get("stale"):
                     run["head_sha"] = "b" * 40
-                runs = [] if state.get("missing") else [run]
+                extra = [{**run, **r} for r in state.get("extra_runs", [])]
+                runs = [] if state.get("missing") else [run, *extra]
                 value = [{"total_count": 100 + len(runs), "check_runs": [
                     {**run, "id": 1000 + i, "name": "optional", "conclusion": "skipped"}
                     for i in range(100)]}, {"total_count": 100 + len(runs), "check_runs": runs}]
@@ -107,6 +108,67 @@ def test_pr_completion_requires_current_required_evidence(github):
         local = kb.create_task(conn, title="local", completion_contract="local-only")
         assert kb.complete_task(conn, local, summary="https://github.com/acme/repo/pull/7 is background context")
         assert len(github["requests"]) == before
+
+
+@pytest.mark.platforms("linux")
+def test_pr_completion_ignores_overtaken_rerun_but_not_current_failure(github):
+    """#TA-706: `filter=latest` can still return more than one check-run row for the
+    same required context/head (a rerun creates a new row, it does not replace the
+    old one). The highest check-run id is the one authoritative current attempt; an
+    overtaken failure must not block completion when it is, and a current failure
+    must still block even if an earlier attempt of the same context once succeeded."""
+    with connect() as conn:
+        # Positive: overtaken failure (lower id) + authoritative current success (higher id).
+        github.update(conclusion="success", head="a" * 40)
+        github["extra_runs"] = [{"id": 41, "conclusion": "failure"}]
+        tid = kb.create_task(conn, title="overtaken-red", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, result="done",
+                                metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        assert kb.get_task(conn, tid).status == "done"
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+            (tid,)).fetchone()[0])
+        assert receipt["classification"] == "success"
+        selected_ids = {c["id"] for c in receipt["checks"]}
+        assert selected_ids == {42}  # only the higher (authoritative) run id was evaluated
+
+        # Negative: an older success (lower id) must never outvote the current failure.
+        github.update(conclusion="failure", head="a" * 40)
+        github["extra_runs"] = [{"id": 41, "conclusion": "success"}]
+        tid = kb.create_task(conn, title="current-red", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        assert kb.get_task(conn, tid).status != "done"
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+            (tid,)).fetchone()[0])
+        assert receipt["classification"] == "failure"
+        github.pop("extra_runs")
+
+
+@pytest.mark.platforms("linux")
+def test_pr_completion_keeps_different_origins_separate_for_unpinned_context(github):
+    """#TA-706 follow-up: an unpinned required context (app_id is None/-1) can be
+    satisfied by check-runs from more than one distinct GitHub App. A higher
+    check-run id from app B must never make collect_acceptance drop app A's run
+    just because B's id happens to be bigger -- that would hide a currently-failing
+    run under an unrelated app's success. Only reruns of the *same* app/origin may
+    replace each other by id."""
+    with connect() as conn:
+        github["required_app_id"] = None
+        github.update(conclusion="success", head="a" * 40, app={"id": 2})
+        github["extra_runs"] = [{"id": 41, "conclusion": "failure", "app": {"id": 1}}]
+        tid = kb.create_task(conn, title="different-app-origin", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        assert kb.get_task(conn, tid).status != "done"
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+            (tid,)).fetchone()[0])
+        assert receipt["classification"] == "failure"
+        selected_ids = {c["id"] for c in receipt["checks"]}
+        assert selected_ids == {41, 42}  # both origins' current runs were evaluated, not just 42
+        github.pop("extra_runs")
 
 
 @pytest.mark.platforms("linux")

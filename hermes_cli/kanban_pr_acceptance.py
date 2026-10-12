@@ -157,7 +157,22 @@ def collect_acceptance(contract: str, published_pr: str | None,
                         (app_id in (None, -1) or r["app"]["id"] == app_id)]
             # A legacy status can satisfy an unpinned context, but never a check pinned to an app.
             legacy = [s for s in statuses if s["context"] == context] if app_id in (None, -1) else []
-            selected = matching + ([max(legacy, key=lambda s: s["id"])] if legacy else [])
+            # A rerun creates a new check-run row for the same context/head; GitHub's
+            # `filter=latest` only dedupes per check *suite*, not per rerun attempt, so an
+            # overtaken attempt and the current one can both come back here (#TA-706). Group by
+            # the run's own app id first so distinct origins (e.g. an unpinned context satisfied
+            # by two different apps) are never collapsed into one another just because one has a
+            # higher database id -- only the highest-id run(s) *within the same origin* replace
+            # that origin's earlier attempts. A tie at the same id (ambiguous evidence) keeps both
+            # rather than guessing, which correctly still blocks on a mix of outcomes.
+            by_origin: dict = {}
+            for run in matching:
+                origin = (run.get("app") or {}).get("id")
+                by_origin.setdefault(origin, []).append(run)
+            current_runs = [r for runs_for_origin in by_origin.values()
+                            for r in runs_for_origin
+                            if r["id"] == max(x["id"] for x in runs_for_origin)]
+            selected = current_runs + ([max(legacy, key=lambda s: s["id"])] if legacy else [])
             if not selected:
                 outcomes.append("missing")
                 receipt["checks"].append({"name": context, "classification": "missing", "head_sha": sha})
