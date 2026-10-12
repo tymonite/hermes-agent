@@ -172,6 +172,31 @@ def test_pr_completion_keeps_different_origins_separate_for_unpinned_context(git
 
 
 @pytest.mark.platforms("linux")
+def test_pr_completion_fails_closed_on_unresolved_origin(github):
+    """#TA-706 follow-up: a check-run with no app id at all (missing/null) carries no
+    evidence that it shares an origin with another such run. Grouping every
+    unresolved-origin run under one shared `None` key would let a currently-failing
+    run with unknown origin be silently outvoted by an unrelated green run that also
+    happens to have no app id -- each unresolved-origin run must stand on its own and
+    keep blocking on its own merits."""
+    with connect() as conn:
+        github["required_app_id"] = None
+        github.update(conclusion="success", head="a" * 40, app=None)
+        github["extra_runs"] = [{"id": 41, "conclusion": "failure", "app": None}]
+        tid = kb.create_task(conn, title="missing-origin", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        assert kb.get_task(conn, tid).status != "done"
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+            (tid,)).fetchone()[0])
+        assert receipt["classification"] == "failure"
+        selected_ids = {c["id"] for c in receipt["checks"]}
+        assert selected_ids == {41, 42}  # both unresolved-origin runs were evaluated, not just 42
+        github.pop("extra_runs")
+
+
+@pytest.mark.platforms("linux")
 def test_acceptance_receipts_and_terminal_write_share_run_ownership(github):
     with connect() as conn:
         for conclusion in ("success", "failure"):
