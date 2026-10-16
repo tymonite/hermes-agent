@@ -354,6 +354,18 @@ _SPECS = [
         _arg("--dry-run", action="store_true", help="Validate the promotion without mutating state"),
         _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
     ], help="Manually move one or more todo/blocked tasks to ready (recovery path)"),
+    _cmd("reopen-done", [
+        _TASK_ID,
+        _arg("--expected-contract",
+             help="Current completion_contract to require before recovering "
+                  "(e.g. an OWNER/REPO or exact PR URL, or omit for 'local-only'/unset). "
+                  "A mismatch refuses rather than guessing which task this is."),
+        _arg("--new-contract", required=True,
+             help="New OWNER/REPO or exact GitHub PR URL to bind instead. Must differ "
+                  "from --expected-contract; 'local-only' is refused."),
+        _reason("Audit-trail reason (recorded on the reopened_for_rework event)"),
+    ], help="Recover a prematurely-closed 'done' task back to rework under a corrected "
+            "PR contract (done -> ready/todo); refuses on any stale expectation or active claim"),
     _cmd("archive", [
         _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
         _arg("--rm", dest="purge_ids", nargs="+",

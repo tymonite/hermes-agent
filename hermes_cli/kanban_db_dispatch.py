@@ -36,6 +36,40 @@ if TYPE_CHECKING:
 # dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
 DEFAULT_FAILURE_LIMIT = 2
 
+# ``_reclaim_dead_workers`` mass-crash circuit breaker: a same-tick cohort of
+# this many or more "dead, no exit code harvested" tasks is treated as a
+# suspected systemic probe failure rather than a real simultaneous crash of
+# every running agent (see that function's docstring).
+_MASS_CRASH_MIN_COUNT = 3
+# How long such a cohort is held before being reclaimed anyway (a genuinely
+# dead worker is still dead after this; a probe glitch has long since cleared).
+_MASS_CRASH_DEFER_SECONDS = 20
+# task_id -> time.time() of the first tick this process saw it as part of an
+# unconfirmed mass-death cohort. Process-local by design (matches
+# ``_recent_worker_exits``): a dispatcher restart just restarts this one
+# grace window, never a correctness issue.
+_mass_crash_first_seen: "dict[str, float]" = {}
+
+# (board_slug, task_id) -> time.time() of the tick this board last reported
+# that task as an unconfirmed "dead, no exit code" candidate. The embedded
+# gateway dispatcher runs ``dispatch_once`` once per board, sequentially,
+# inside the SAME tick (``KanbanDispatcher.tick_once``) — so a systemic
+# probe failure (host under memory/CPU pressure) tends to hit several
+# boards in that same tick, just 1-2 workers per board. Counting
+# ``_MASS_CRASH_MIN_COUNT`` per board alone (the original implementation)
+# missed that cross-board pattern entirely: two boards with 1-2 dead
+# workers each never individually reach the threshold, so both skip the
+# confirmation window and get reclaimed (and respawned) instantly, even
+# though combined they are exactly the kind of same-tick, zero-confirmed-
+# exit cohort the mass-crash defer exists to protect against. Entries
+# older than ``_GLOBAL_UNKNOWN_COHORT_WINDOW_SECONDS`` are pruned so a
+# board that stops reporting a task doesn't linger in the global count.
+_global_unknown_cohort: "dict[tuple[str, str], float]" = {}
+# Generous multiple of one dispatcher tick: every board's ``dispatch_once``
+# runs sequentially inside one tick (seconds, not minutes), so entries from
+# the same tick cohort across all boards are always within this window.
+_GLOBAL_UNKNOWN_COHORT_WINDOW_SECONDS = 30
+
 # Worker log files larger than this at spawn time are rotated.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
 DEFAULT_LOG_BACKUP_COUNT = 1
@@ -228,9 +262,37 @@ def _classify_worker_exit(pid: int) -> tuple[str, Optional[int]]:
     """``(kind, code)`` for a reaped worker PID: ``clean_exit`` (rc 0 while
     still ``running`` = protocol violation), ``rate_limited``
     (``KANBAN_RATE_LIMIT_EXIT_CODE``, never counts as a failure),
-    ``nonzero_exit``, ``signaled`` (``code`` is the signal), ``unknown`` (pid
-    not in the reap registry; ``code`` None)."""
+    ``nonzero_exit``, ``signaled`` (``code`` is the signal), ``orphaned``
+    (pid is confirmed NOT our child — it outlived a gateway restart and was
+    reparented away, so this process can never waitpid() it; ``code`` None),
+    ``unknown`` (pid not in the reap registry and a direct, targeted
+    ``waitpid`` found nothing either; ``code`` None).
+
+    The bulk ``waitpid(-1)`` sweep in :func:`reap_worker_zombies` runs once
+    per dispatcher tick, BEFORE the per-board liveness probes that declare a
+    task's worker dead. Under a loaded host the probes can observe a pid in
+    zombie state a few hundred ms to several ticks AFTER that sweep already
+    ran and found nothing (#131204 — observed as a multi-minute gap between
+    zombie-reap log lines while tasks kept being declared dead with no exit
+    code, loadavg ~30 at the time). A targeted ``waitpid(pid, WNOHANG)``
+    right here, on the specific pid the caller already believes is dead,
+    closes that race: if it's still genuinely our child it reaps cleanly
+    even though the bulk sweep missed it this tick. ``ECHILD`` instead tells
+    us definitively this pid was never ours to reap from this process — the
+    worker outlived a gateway restart (dispatcher restart reparents every
+    still-running worker to launchd/init) and nothing running now can ever
+    recover its exit status via waitpid; that gets its own ``orphaned`` kind
+    so the event says WHY instead of silently losing the code."""
     entry = _recent_worker_exits.get(int(pid))
+    if entry is None and not _kb._IS_WINDOWS:
+        try:
+            reaped_pid, status = os.waitpid(int(pid), os.WNOHANG)
+        except ChildProcessError:
+            return ("orphaned", None)
+        else:
+            if reaped_pid == int(pid):
+                _record_worker_exit(reaped_pid, status)
+                entry = _recent_worker_exits.get(int(pid))
     if entry is None:
         return ("unknown", None)
     raw, _ = entry
@@ -321,6 +383,17 @@ def _pid_alive(pid: Optional[int]) -> bool:
     worker would look "alive" forever between exit and reap. Linux: peek at
     ``/proc/<pid>/status`` and treat ``State: Z`` as dead; macOS: ask ``ps``
     for the BSD ``stat`` field and treat ``Z`` as dead.
+
+    Fail-dead only on a CONFIRMED signal (``kill(0)`` raised ESRCH, inside
+    ``_pid_exists``, or the secondary zombie probe positively read a ``Z``
+    state). A secondary probe that cannot be read at all — ``ps`` exits
+    non-zero (sandboxed/throttled host, momentary resource exhaustion),
+    times out, or the ``/proc`` entry raises something other than
+    "already gone" — answers "unknown", and unknown is NOT dead: the
+    already-confirmed ``kill(0)`` liveness answer wins (every running
+    worker on a host was once declared dead in the same tick because this
+    downgraded a live PID to dead whenever the secondary probe merely
+    failed to answer).
     """
     if not pid or pid <= 0:
         return False
@@ -337,7 +410,8 @@ def _pid_alive(pid: Optional[int]) -> bool:
                             return False
                         break
         except (FileNotFoundError, PermissionError, OSError):
-            # proc entry gone → already reaped; treat as dead.
+            # proc entry gone / unreadable → can't confirm zombie state
+            # either way; keep the kill(0)-confirmed "alive" answer.
             pass
     elif sys.platform == "darwin":
         try:
@@ -349,12 +423,14 @@ def _pid_alive(pid: Optional[int]) -> bool:
                 timeout=1,
                 check=False,
             )
-            if proc.returncode != 0:
+            if proc.returncode == 0 and "Z" in (proc.stdout or "").strip():
                 return False
-            if "Z" in (proc.stdout or "").strip():
-                return False
+            # Non-zero returncode (incl. transient "no such pid" races under
+            # load, or a sandboxed exec denial) is NOT a confirmed kill —
+            # ``ps`` can fail for reasons unrelated to the target process.
+            # The kill(0)-confirmed "alive" answer stands.
         except (OSError, subprocess.SubprocessError, TimeoutError):
-            # If the secondary probe fails, keep the kill(0) answer.
+            # Secondary probe unreadable: keep the kill(0) answer.
             pass
     return True
 
@@ -395,24 +471,54 @@ def _worker_alive(pid: Optional[int], started_at) -> bool:
 
 
 def _pid_recycled(pid: Optional[int], started_at) -> bool:
-    """True when a live ``pid`` is NOT the process fingerprinted at spawn (or the fingerprint can no
-    longer be read). Signalling it would hit a stranger. ``None`` fingerprint = legacy row, never
-    recycled; the UNVERIFIED marker is always foreign. An integer fingerprint (rows written before the
-    boot witness was added) compares the start time only."""
+    """True when a live ``pid`` is CONFIRMED to be a different process than the one fingerprinted at
+    spawn. Signalling it would hit a stranger. ``None`` fingerprint = legacy row, never recycled; the
+    UNVERIFIED marker is always foreign. An integer fingerprint (rows written before the boot witness
+    was added) compares the start time only.
+
+    When the current fingerprint/start-time cannot be read at all (``_process_fingerprint`` /
+    ``get_process_start_time`` returns ``None`` — a transient ``/proc`` or ``ps`` read failure, not a
+    process exit, which ``_pid_alive`` already ruled out before this is ever called), the answer is
+    "unknown", and unknown must NOT be treated as "recycled" (fail-dead): it falls back to "still ours"
+    so a momentary read glitch never masquerades as a confirmed PID recycle. A genuinely recycled PID
+    is caught on the next successful read instead.
+
+    The numeric start-time component is compared with ``START_TIME_DRIFT_TOLERANCE`` slack via
+    ``start_time_fingerprints_match``, not exact equality: on macOS ``current_instantiation_epoch()``
+    always reads ``""`` (it is Linux-only, see its docstring), so the "epoch|start" fingerprint
+    degrades to just the psutil-derived start time there, and repeated readings of the SAME
+    still-running process can disagree by up to ~1s across a ``kern.boottime`` adjustment (sleep/wake,
+    NTP correction — #117505). An exact-string-equality compare treated that drift as a confirmed
+    recycle: a genuinely alive, unchanged worker got mass-declared dead under load for no reason
+    other than the host having slept in between two liveness checks.
+    """
     if started_at is None or not pid:
         return False
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         return True
     if isinstance(started_at, str) and "|" in started_at:
-        return _process_fingerprint(int(pid)) != started_at
+        current_fp = _process_fingerprint(int(pid))
+        if current_fp is None:
+            return False
+        cur_epoch, _, cur_start = current_fp.partition("|")
+        rec_epoch, _, rec_start = started_at.partition("|")
+        if cur_epoch != rec_epoch:
+            return True  # different boot/container instantiation — a genuine recycle
+        from gateway.status import start_time_fingerprints_match
+        try:
+            return not start_time_fingerprints_match(int(rec_start), int(cur_start))
+        except (TypeError, ValueError):
+            # Unparsable start-time component: fall back to the original strict
+            # compare rather than guessing.
+            return current_fp != started_at
     from gateway.status import _start_times_agree, get_process_start_time
     current = get_process_start_time(int(pid))
     if current is None:
-        return True
+        return False
     try:
         return not _start_times_agree(current, started_at)
     except (TypeError, ValueError):
-        return True
+        return False
 
 
 def _kill_fn(signal_fn) -> Optional[Callable[[int, int], None]]:
@@ -1079,7 +1185,7 @@ def _classify_dead_worker_exit(
     epilogue (killed, OOM) leaves no trailer and stays a plain crash.
     """
     kind, code = _classify_worker_exit(pid)
-    if kind == "unknown" and task_id:
+    if kind in ("unknown", "orphaned") and task_id:
         logged = _worker_log_exit_code(task_id, board=board)
         if logged is not None:
             kind, code = _exit_code_kind(logged)
@@ -1121,11 +1227,19 @@ def _classify_dead_worker_exit(
         error_text = f"pid {pid} exited with code {code}"
     elif kind == "signaled":
         error_text = f"pid {pid} killed by signal {code}"
+    elif kind == "orphaned":
+        error_text = (
+            f"pid {pid} not alive — confirmed not a child of this dispatcher process "
+            "(waitpid raised ECHILD), so its exit status was never observable here; "
+            "it most likely outlived a gateway restart and was reparented away before it exited"
+        )
     else:
-        error_text = f"pid {pid} not alive"
-    event_payload = {"pid": pid, "claimer": claimer}
-    if code is not None and kind != "unknown":
-        event_payload["exit_kind"] = kind
+        error_text = f"pid {pid} not alive (no exit status could be harvested)"
+    # ``exit_kind`` is ALWAYS recorded now, even when no exit code could be
+    # harvested (``unknown``/``orphaned``): the done-criterion for #131204 is
+    # that every crash event says WHY, not just the ones where a code landed.
+    event_payload = {"pid": pid, "claimer": claimer, "exit_kind": kind}
+    if code is not None:
         event_payload["exit_code"] = code
     return _DeadWorker(kind, code, error_text, "crashed", event_payload)
 
@@ -1145,7 +1259,22 @@ class _CrashSweep:
 
 
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
-    """Release every host-local ``running`` task whose worker PID is dead."""
+    """Release every host-local ``running`` task whose worker PID is dead.
+
+    One txn, two passes: first classify every candidate WITHOUT mutating
+    anything, so a same-tick cohort of >= ``_MASS_CRASH_MIN_COUNT`` workers
+    that all look dead with no harvested exit code (``_classify_dead_worker``
+    kind ``unknown`` — the dispatcher never actually witnessed any of them
+    exit, it only computed liveness from a probe) can be told apart from an
+    ordinary one-off dead worker BEFORE any claim is released. A mass
+    same-second "everyone's dead" verdict with zero confirmed exits is far
+    more likely a systemic probe glitch on this host than a real
+    simultaneous crash of every running agent; reclaiming instantly would
+    spawn a duplicate worker beside every one of them. Such a cohort is
+    deferred for ``_MASS_CRASH_DEFER_SECONDS`` (state kept per task in
+    ``_mass_crash_first_seen``) and reclaimed only once the SAME task still
+    looks dead after that window — a second, time-separated confirmation.
+    """
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
         rows = conn.execute(
@@ -1154,6 +1283,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = _kb._host_prefix()
+        candidates: "list[tuple[Any, int, _DeadWorker]]" = []
         for row in rows:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
@@ -1168,6 +1298,66 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
 
             pid = int(row["worker_pid"])
             dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
+            candidates.append((row, pid, dead))
+
+        now = time.time()
+        # The mass-crash breaker groups BOTH ambiguous races ("unknown": the
+        # bulk sweep and the targeted retry both missed it) and definitively
+        # unreapable pids ("orphaned": confirmed ECHILD, not our child) —
+        # from the operator's seat both look identical ("N workers dead, 0
+        # exit codes harvested in this tick") and both deserve the same
+        # systemic-probe-failure suspicion before duplicates get spawned.
+        _NO_CODE_HARVESTED = ("unknown", "orphaned")
+        unknown_ids = {
+            row["id"] for row, _pid, dead in candidates
+            if dead.kind in _NO_CODE_HARVESTED and not dead.rate_limited
+        }
+        unknown_pids = {
+            row["id"]: pid for row, pid, dead in candidates
+            if dead.kind in _NO_CODE_HARVESTED and not dead.rate_limited
+        }
+        board_key = board or _kb.get_current_board()
+        # Fold this board's current "unknown" candidates into the process-wide
+        # cohort, pruning anything stale first, so the threshold is judged
+        # across every board this process dispatches, not just this one.
+        stale_cutoff = now - _GLOBAL_UNKNOWN_COHORT_WINDOW_SECONDS
+        for key, seen_at in list(_global_unknown_cohort.items()):
+            if seen_at < stale_cutoff:
+                _global_unknown_cohort.pop(key, None)
+        for _bkey, _tid in list(_global_unknown_cohort):
+            if _bkey == board_key and _tid not in unknown_ids:
+                _global_unknown_cohort.pop((_bkey, _tid), None)
+        for tid in unknown_ids:
+            _global_unknown_cohort[(board_key, tid)] = now
+
+        mass_event = len(_global_unknown_cohort) >= _MASS_CRASH_MIN_COUNT
+        if mass_event:
+            cross_board = sorted(_global_unknown_cohort)
+            _kb._log.warning(
+                "kanban: %d workers reported dead in the same tick with no harvested "
+                "exit code across %d board(s) (%s) — suspected systemic probe failure "
+                "rather than a real mass crash; deferring reclaim up to %ss per task "
+                "for a second, time-separated confirmation instead of respawning "
+                "duplicates. This board's pids: %s",
+                len(_global_unknown_cohort), len({b for b, _t in cross_board}), cross_board,
+                _MASS_CRASH_DEFER_SECONDS, {tid: unknown_pids[tid] for tid in unknown_ids},
+            )
+        # Drop stale per-task state for tasks no longer in an unconfirmed cohort
+        # (worker came back alive, or already reclaimed) so the dict can't leak.
+        for tid in list(_mass_crash_first_seen):
+            if tid not in unknown_ids:
+                _mass_crash_first_seen.pop(tid, None)
+
+        for row, pid, dead in candidates:
+            tid = row["id"]
+            deferring = False
+            if mass_event and tid in unknown_ids:
+                first_seen = _mass_crash_first_seen.setdefault(tid, now)
+                if now - first_seen < _MASS_CRASH_DEFER_SECONDS:
+                    deferring = True
+            if deferring:
+                continue  # inside the confirmation window — not reclaimed yet
+
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -1178,7 +1368,22 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 (retry_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount != 1:
+                # Row changed out from under us (already reclaimed via another
+                # path, or the worker legitimately completed between the SELECT
+                # and here) — NOT a reason to re-arm the confirmation window if
+                # it reappears next tick still "running" with the same dead pid;
+                # only drop the per-task clock once the reclaim actually lands.
                 continue
+            _mass_crash_first_seen.pop(tid, None)
+            # Deliberately NOT popped from ``_global_unknown_cohort`` here: a
+            # same-tick sibling board processed right after this one (the
+            # embedded dispatcher visits boards sequentially within one tick)
+            # must still see this task counted when it folds in ITS OWN
+            # candidates a few milliseconds later, so a 2-board / 1-board
+            # split reliably reaches the combined threshold. The entry is
+            # cleaned up on this board's own NEXT visit (top-of-function
+            # cleanup, once the task is no longer in its ``unknown_ids``) or
+            # by the TTL prune, whichever comes first.
             run_id = _kb._end_run(
                 conn, row["id"],
                 outcome=dead.run_outcome, status=dead.run_outcome,

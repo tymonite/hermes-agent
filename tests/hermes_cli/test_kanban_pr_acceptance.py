@@ -216,6 +216,35 @@ def test_assignee_without_own_gh_login_never_falls_through_to_ambient_login(tmp_
     assert "GH_TOKEN" not in captured and "GITHUB_TOKEN" not in captured
 
 
+@pytest.mark.parametrize("state", [None, "unexpected", "", "merged"])
+def test_verify_pr_target_refuses_incomplete_or_unrecognized_state(monkeypatch, state):
+    """The reviewer's second blocking finding: only an explicit 'open' state, or a
+    'closed' state with merged=True, is a usable recovery target. A missing/None
+    state, an unrecognized value, or anything else must be refused as incomplete
+    evidence rather than silently passing because it merely isn't 'closed'."""
+    from hermes_cli import kanban_pr_acceptance as pra
+
+    monkeypatch.setattr(pra, "_api", lambda *a, **k: {"state": state})
+    with pytest.raises(ValueError, match="could not be verified"):
+        pra.verify_pr_target("acme/repo", 7)
+
+
+@pytest.mark.parametrize("state,merged,should_raise", [
+    ("open", False, False),
+    ("closed", True, False),
+    ("closed", False, True),
+])
+def test_verify_pr_target_accepts_only_open_or_merged(monkeypatch, state, merged, should_raise):
+    from hermes_cli import kanban_pr_acceptance as pra
+
+    monkeypatch.setattr(pra, "_api", lambda *a, **k: {"state": state, "merged": merged})
+    if should_raise:
+        with pytest.raises(ValueError, match="closed and not merged"):
+            pra.verify_pr_target("acme/repo", 7)
+    else:
+        pra.verify_pr_target("acme/repo", 7)  # does not raise
+
+
 def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, monkeypatch):
     """A card assigned to a profile that no longer exists must not run gh as the completing
     process's ambient login: classification `auth` naming the profile, gh never invoked."""
